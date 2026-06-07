@@ -57,7 +57,7 @@ static void nvs_put_int(const char*k, int v){
 
 /* ---------- servo + IK ---------- */
 static void servo_write(int ch, float ang){
-    int sig = 511 + (int)(ang / 0.29f);
+    int sig = 511 + (int)(ang / 0.263f);
     if(sig<0) sig=0;
     if(sig>1023) sig=1023;
     WritePos(ch, sig, 0, 0);
