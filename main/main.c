@@ -452,7 +452,7 @@ static void gait_task(void *arg){
 
         }else if(Jump){
             float crouchZ = 35;
-            float pushZ   = 105;
+            float pushZ   = 100;
             float tuckZ   = 45;
 
             if(crouchZ < 25) crouchZ = 25;
@@ -471,7 +471,7 @@ static void gait_task(void *arg){
 
             // Phase 2: Explosive extension
             fRIK(0,0,pushZ); fLIK(0,0,pushZ); rRIK(0,0,pushZ); rLIK(0,0,pushZ);
-            vTaskDelay(pdMS_TO_TICKS(110));
+            vTaskDelay(pdMS_TO_TICKS(200));
 
             // Phase 3: Quick tuck
             time_mSt=millis(); tim=0; 
