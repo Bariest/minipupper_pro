@@ -1,0 +1,16 @@
+# Build artifacts
+build/
+sdkconfig
+sdkconfig.old
+dist/
+FTServo_stm32HAL-main/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

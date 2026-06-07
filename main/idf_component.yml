@@ -1,0 +1,3 @@
+dependencies:
+  idf: ">=5.0"
+  dong-12345/ftservo: "^1.1.0"
