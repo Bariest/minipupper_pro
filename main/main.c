@@ -525,11 +525,11 @@ static void gait_task(void *arg){
             servo_speed_all(0);   // 0 = full speed = maximum pop
             fRIK(0,0,pushZ); fLIK(0,0,pushZ); rRIK(0,0,pushZ); rLIK(0,0,pushZ);
             servo_flush();
-            vTaskDelay(pdMS_TO_TICKS(200));
+            vTaskDelay(pdMS_TO_TICKS(210));
 
             // Phase 3: Quick tuck
             time_mSt=millis(); tim=0;
-            int tuckMs = 80;
+            int tuckMs = 60;
             while(tim<tuckMs){ tim=millis()-time_mSt;
                 float frac = (float)tim / (float)tuckMs;
                 float z = pushZ - (pushZ - tuckZ) * frac;
