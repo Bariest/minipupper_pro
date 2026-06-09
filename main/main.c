@@ -504,44 +504,47 @@ static void gait_task(void *arg){
 
         }else if(Jump){
             float crouchZ = 40;
-            float pushZ   = 100;
+            float pushZ   = 105;
             float tuckZ   = 45;
 
-            if(crouchZ < 25) crouchZ = 25;
-            if(pushZ > 105)  pushZ = 105;
-
-            // Phase 1: Deep crouch
+            // --- Phase 1: Crouch (faster ramp down) ---
             time_mSt=millis(); tim=0;
-            while(tim<period*3){ tim=millis()-time_mSt; tt=(float)(tim*PI/2.0/(period*3));
+            while(tim<period*2){ tim=millis()-time_mSt;
+                tt = (float)(tim * PI / 2.0 / (period*2));
                 float z = height - (height - crouchZ) * sinf(tt);
                 fRIK(0,0,z); fLIK(0,0,z); rRIK(0,0,z); rLIK(0,0,z); servo_flush(); }
 
-            // Hold crouch
+            // --- Brief settle: just enough for all 12 servos to reach crouchZ ---
             time_mSt=millis(); tim=0;
-            while(tim<period*2){ tim=millis()-time_mSt;
+            while(tim<20){ tim=millis()-time_mSt;
                 fRIK(0,0,crouchZ); fLIK(0,0,crouchZ); rRIK(0,0,crouchZ); rLIK(0,0,crouchZ); servo_flush(); }
 
-            // Phase 2: Explosive extension — force max speed on all legs
-            servo_speed_all(0);   // 0 = full speed = maximum pop
+            // --- Phase 2: Explosive extension, sent TWICE for bus reliability ---
+            servo_speed_all(0);
             fRIK(0,0,pushZ); fLIK(0,0,pushZ); rRIK(0,0,pushZ); rLIK(0,0,pushZ);
             servo_flush();
-            vTaskDelay(pdMS_TO_TICKS(210));
+            servo_flush(); // second packet: if one servo missed it, it catches it here
 
-            // Phase 3: Quick tuck
+            // Airborne window scaled to crouch depth: deeper = longer flight time
+            int airMs = (int)(160.0f + (70.0f - crouchZ) * 1.0f); // around 190ish ADJUST THE 160F
+            vTaskDelay(pdMS_TO_TICKS(airMs));
+
+            // --- Phase 3: Smooth tuck using sinf (was linear) ---
             time_mSt=millis(); tim=0;
             int tuckMs = 60;
             while(tim<tuckMs){ tim=millis()-time_mSt;
-                float frac = (float)tim / (float)tuckMs;
+                float frac = sinf((float)tim * PI / 2.0f / (float)tuckMs); // smooth, not linear
                 float z = pushZ - (pushZ - tuckZ) * frac;
                 fRIK(0,0,z); fLIK(0,0,z); rRIK(0,0,z); rLIK(0,0,z); servo_flush(); }
 
-            // Phase 4: Land / recover
+            // --- Phase 4: Soft landing recovery ---
             time_mSt=millis(); tim=0;
-            while(tim<period*3){ tim=millis()-time_mSt; tt=(float)(tim*PI/2.0/(period*3));
+            while(tim<period*3){ tim=millis()-time_mSt;
+                tt = (float)(tim * PI / 2.0 / (period*3));
                 float z = tuckZ + (height - tuckZ) * sinf(tt);
                 fRIK(0,0,z); fLIK(0,0,z); rRIK(0,0,z); rLIK(0,0,z); servo_flush(); }
 
-            Jump = 0;
+            Jump = 0;  
 
         }else{
             fRIK(0,0,height); rRIK(0,0,height); fLIK(0,0,height); rLIK(0,0,height);
