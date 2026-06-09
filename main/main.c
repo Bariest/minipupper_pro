@@ -35,6 +35,50 @@ static int Twerk=0, Jump=0;
 
 static int period=80, height=70, upHeight=10, stride=10, tilt=10;
 
+/* ---------- sync write buffer ---------- */
+/* goal[1..12]       = target signal (0..1023) for each servo
+   goal_speed[1..12] = per-servo speed (0 = full/max speed)            */
+static uint16_t goal[13];
+static uint16_t goal_speed[13];                 // all start at 0 (full speed)
+static const uint8_t sync_ids[12] = {1,2,3,4,5,6,7,8,9,10,11,12};
+
+/* set the speed for ONE servo (call before servo_flush) */
+static inline void servo_speed(int ch, uint16_t spd){
+    goal_speed[ch] = spd;
+}
+/* set the same speed for ALL servos */
+static inline void servo_speed_all(uint16_t spd){
+    for(int i=1;i<=12;i++) goal_speed[i] = spd;
+}
+
+/* push positions + per-servo speeds to all 12 servos in ONE packet.
+ *
+ * IMPORTANT FIX:
+ *  - This loop used to be hammered with no yield, which flooded the
+ *    half-duplex servo bus and starved the idle task -> servos die while
+ *    the ESP keeps running. We now pace it to ~5 ms/frame and yield, which
+ *    mimics the natural pacing of the per-servo WritePos() version.
+ *  - speed is sent as 0 (= max speed), exactly like WritePos(ch,sig,0,0).
+ */
+static void servo_flush(void){
+    static int64_t last_us = 0;
+
+    /* pace to ~5 ms per frame: never floods the bus, and vTaskDelay lets the
+       idle task run (feeds the watchdog) and lets the UART TX drain */
+    while(esp_timer_get_time() - last_us < 5000){
+        vTaskDelay(1);
+    }
+    last_us = esp_timer_get_time();
+
+    uint16_t pos[12], spd[12], tim[12];
+    for(int i=0; i<12; i++){
+        pos[i] = goal[i+1];
+        tim[i] = 0;                 /* time=0: no timed control */
+        spd[i] = goal_speed[i+1];   /* 0 == max speed, same as WritePos(ch,sig,0,0) */
+    }
+    SyncWritePos((uint8_t*)sync_ids, 12, pos, tim, spd);
+}
+
 /* ---------- helpers ---------- */
 static inline uint32_t millis(void){ return (uint32_t)(esp_timer_get_time()/1000ULL); }
 
@@ -56,11 +100,12 @@ static void nvs_put_int(const char*k, int v){
 }
 
 /* ---------- servo + IK ---------- */
+/* NOTE: only stores into goal[]; transmission happens in servo_flush() */
 static void servo_write(int ch, float ang){
     int sig = 511 + (int)(ang / 0.263f);
     if(sig<0) sig=0;
     if(sig>1023) sig=1023;
-    WritePos(ch, sig, 0, 0);
+    goal[ch] = (uint16_t)sig;
 }
 static void fRIK(float x,float th0,float z){
     float zd=z/cosf(th0/180.0f*PI);
@@ -283,10 +328,10 @@ static void wifi_init_softap(void){
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ac));
     ESP_ERROR_CHECK(esp_wifi_start());
-    
+
     // *** DISABLE WIFI POWER SAVING TO REDUCE LAG ***
     esp_wifi_set_ps(WIFI_PS_NONE);
-    
+
     ESP_LOGI(TAG, "AP started: 192.168.55.22");
 }
 
@@ -294,164 +339,171 @@ static void wifi_init_softap(void){
 static void gait_task(void *arg){
     float tim, tt;
     uint32_t time_mSt;
-    
+
+    /* start with all servos centered + ALL SPEEDS = 0 (full speed) */
+    for(int i=1;i<=12;i++) goal[i] = 511;
+    servo_speed_all(0);          // <<< everything defaults to 0 here
+
     for(;;){
         if(Ini){
+            servo_speed_all(0);  // keep full speed (change here if you want slow homing)
             for(int i=1; i<=12; i++) servo_write(i, offset[i]);
+            servo_flush();
+            vTaskDelay(1);
 
         }else if(Step){
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                fRIK(0,0,height-upHeight*sinf(tt)); rLIK(0,0,height-upHeight*sinf(tt)); }
-            time_mSt=millis(); tim=0; 
+                fRIK(0,0,height-upHeight*sinf(tt)); rLIK(0,0,height-upHeight*sinf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                fRIK(0,0,height-upHeight*cosf(tt)); rLIK(0,0,height-upHeight*cosf(tt)); }
-            time_mSt=millis(); tim=0; 
+                fRIK(0,0,height-upHeight*cosf(tt)); rLIK(0,0,height-upHeight*cosf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                rRIK(0,0,height-upHeight*sinf(tt)); fLIK(0,0,height-upHeight*sinf(tt)); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0,0,height-upHeight*sinf(tt)); fLIK(0,0,height-upHeight*sinf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                rRIK(0,0,height-upHeight*cosf(tt)); fLIK(0,0,height-upHeight*cosf(tt)); }
+                rRIK(0,0,height-upHeight*cosf(tt)); fLIK(0,0,height-upHeight*cosf(tt)); servo_flush(); }
 
         }else if(Roll){
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period*8){ tim=millis()-time_mSt; tt=(float)(tim*2*PI/(period*8));
                 fRIK(0,-tilt*sinf(tt),height); rLIK(0,tilt*sinf(tt),height);
-                rRIK(0,tilt*sinf(tt),height);  fLIK(0,-tilt*sinf(tt),height); }
+                rRIK(0,tilt*sinf(tt),height);  fLIK(0,-tilt*sinf(tt),height); servo_flush(); }
 
         }else if(Pitch){
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period*8){ tim=millis()-time_mSt; tt=(float)(tim*2*PI/(period*8));
                 fRIK(0,0,height-upHeight*sinf(tt)); rLIK(0,0,height+upHeight*sinf(tt));
-                rRIK(0,0,height+upHeight*sinf(tt)); fLIK(0,0,height-upHeight*sinf(tt)); }
+                rRIK(0,0,height+upHeight*sinf(tt)); fLIK(0,0,height-upHeight*sinf(tt)); servo_flush(); }
 
         }else if(Stretch){
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period*8){ tim=millis()-time_mSt; tt=(float)(tim*2*PI/(period*8));
                 fRIK(0,0,height+upHeight*sinf(tt)); rLIK(0,0,height+upHeight*sinf(tt));
-                rRIK(0,0,height+upHeight*sinf(tt)); fLIK(0,0,height+upHeight*sinf(tt)); }
+                rRIK(0,0,height+upHeight*sinf(tt)); fLIK(0,0,height+upHeight*sinf(tt)); servo_flush(); }
 
         }else if(Advance){
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(-stride*cosf(tt),0,height-upHeight*sinf(tt)); rLIK(-stride*cosf(tt),0,height-upHeight*sinf(tt));
-                rRIK( stride*cosf(tt),0,height);                   fLIK( stride*cosf(tt),0,height); }
-            time_mSt=millis(); tim=0; 
+                rRIK( stride*cosf(tt),0,height);                   fLIK( stride*cosf(tt),0,height); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK( stride*sinf(tt),0,height-upHeight*cosf(tt)); rLIK( stride*sinf(tt),0,height-upHeight*cosf(tt));
-                rRIK(-stride*sinf(tt),0,height);                   fLIK(-stride*sinf(tt),0,height); }
-            time_mSt=millis(); tim=0; 
+                rRIK(-stride*sinf(tt),0,height);                   fLIK(-stride*sinf(tt),0,height); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK( stride*cosf(tt),0,height);                   rLIK( stride*cosf(tt),0,height);
-                rRIK(-stride*cosf(tt),0,height-upHeight*sinf(tt)); fLIK(-stride*cosf(tt),0,height-upHeight*sinf(tt)); }
-            time_mSt=millis(); tim=0; 
+                rRIK(-stride*cosf(tt),0,height-upHeight*sinf(tt)); fLIK(-stride*cosf(tt),0,height-upHeight*sinf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(-stride*sinf(tt),0,height);                   rLIK(-stride*sinf(tt),0,height);
-                rRIK( stride*sinf(tt),0,height-upHeight*cosf(tt)); fLIK( stride*sinf(tt),0,height-upHeight*cosf(tt)); }
+                rRIK( stride*sinf(tt),0,height-upHeight*cosf(tt)); fLIK( stride*sinf(tt),0,height-upHeight*cosf(tt)); servo_flush(); }
 
         }else if(Back){
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK( stride*cosf(tt),0,height-upHeight*sinf(tt)); rLIK( stride*cosf(tt)+15,0,height-upHeight*sinf(tt));
-                rRIK(-stride*cosf(tt)+15,0,height);                fLIK(-stride*cosf(tt),0,height); }
-            time_mSt=millis(); tim=0; 
+                rRIK(-stride*cosf(tt)+15,0,height);                fLIK(-stride*cosf(tt),0,height); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(-stride*sinf(tt),0,height-upHeight*cosf(tt)); rLIK(-stride*sinf(tt)+15,0,height-upHeight*cosf(tt));
-                rRIK( stride*sinf(tt)+15,0,height);                fLIK( stride*sinf(tt),0,height); }
-            time_mSt=millis(); tim=0; 
+                rRIK( stride*sinf(tt)+15,0,height);                fLIK( stride*sinf(tt),0,height); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(-stride*cosf(tt),0,height);                   rLIK(-stride*cosf(tt)+15,0,height);
-                rRIK( stride*cosf(tt)+15,0,height-upHeight*sinf(tt)); fLIK( stride*cosf(tt),0,height-upHeight*sinf(tt)); }
-            time_mSt=millis(); tim=0; 
+                rRIK( stride*cosf(tt)+15,0,height-upHeight*sinf(tt)); fLIK( stride*cosf(tt),0,height-upHeight*sinf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK( stride*sinf(tt),0,height);                   rLIK( stride*sinf(tt)+15,0,height);
-                rRIK(-stride*sinf(tt)+15,0,height-upHeight*cosf(tt)); fLIK(-stride*sinf(tt),0,height-upHeight*cosf(tt)); }
+                rRIK(-stride*sinf(tt)+15,0,height-upHeight*cosf(tt)); fLIK(-stride*sinf(tt),0,height-upHeight*cosf(tt)); servo_flush(); }
 
         }else if(Left){
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0, tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt)); rLIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt));
-                rRIK(0, tilt*cosf(tt),height-upHeight*cosf(tt));        fLIK(0,-tilt*cosf(tt),height-upHeight*cosf(tt)); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0, tilt*cosf(tt),height-upHeight*cosf(tt));        fLIK(0,-tilt*cosf(tt),height-upHeight*cosf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                rRIK(0,-tilt*sinf(tt),height); fLIK(0,tilt*sinf(tt),height); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0,-tilt*sinf(tt),height); fLIK(0,tilt*sinf(tt),height); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0,-tilt*cosf(tt),height-upHeight*cosf(tt)); rLIK(0,tilt*cosf(tt),height-upHeight*cosf(tt));
-                rRIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt)); fLIK(0,tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt)); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt)); fLIK(0,tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                fRIK(0,tilt*sinf(tt),height); rLIK(0,-tilt*sinf(tt),height); }
+                fRIK(0,tilt*sinf(tt),height); rLIK(0,-tilt*sinf(tt),height); servo_flush(); }
 
         }else if(Right){
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt)); rLIK(0,tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt));
-                rRIK(0,-tilt*cosf(tt),height-upHeight*cosf(tt));        fLIK(0,tilt*cosf(tt),height-upHeight*cosf(tt)); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0,-tilt*cosf(tt),height-upHeight*cosf(tt));        fLIK(0,tilt*cosf(tt),height-upHeight*cosf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                rRIK(0,tilt*sinf(tt),height); fLIK(0,-tilt*sinf(tt),height); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0,tilt*sinf(tt),height); fLIK(0,-tilt*sinf(tt),height); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0,tilt*cosf(tt),height-upHeight*cosf(tt)); rLIK(0,-tilt*cosf(tt),height-upHeight*cosf(tt));
-                rRIK(0,tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt)); fLIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt)); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0,tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt)); fLIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                fRIK(0,-tilt*sinf(tt),height); rLIK(0,tilt*sinf(tt),height); }
+                fRIK(0,-tilt*sinf(tt),height); rLIK(0,tilt*sinf(tt),height); servo_flush(); }
 
         }else if(TurnL){
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0, tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt)); rLIK(0, tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt));
-                rRIK(0,-tilt*cosf(tt),height-upHeight*cosf(tt));        fLIK(0,-tilt*cosf(tt),height-upHeight*cosf(tt)); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0,-tilt*cosf(tt),height-upHeight*cosf(tt));        fLIK(0,-tilt*cosf(tt),height-upHeight*cosf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                rRIK(0,tilt*sinf(tt),height); fLIK(0,tilt*sinf(tt),height); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0,tilt*sinf(tt),height); fLIK(0,tilt*sinf(tt),height); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0,-tilt*cosf(tt),height-upHeight*cosf(tt));         rLIK(0,-tilt*cosf(tt),height-upHeight*cosf(tt));
-                rRIK(0,tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt));   fLIK(0,tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt)); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0,tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt));   fLIK(0,tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                fRIK(0,tilt*sinf(tt),height); rLIK(0,tilt*sinf(tt),height); }
+                fRIK(0,tilt*sinf(tt),height); rLIK(0,tilt*sinf(tt),height); servo_flush(); }
 
         }else if(TurnR){
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt)); rLIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt));
-                rRIK(0, tilt*cosf(tt),height-upHeight*cosf(tt));        fLIK(0, tilt*cosf(tt),height-upHeight*cosf(tt)); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0, tilt*cosf(tt),height-upHeight*cosf(tt));        fLIK(0, tilt*cosf(tt),height-upHeight*cosf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                rRIK(0,-tilt*sinf(tt),height); fLIK(0,-tilt*sinf(tt),height); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0,-tilt*sinf(tt),height); fLIK(0,-tilt*sinf(tt),height); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0,tilt*cosf(tt),height-upHeight*cosf(tt));          rLIK(0,tilt*cosf(tt),height-upHeight*cosf(tt));
-                rRIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt));  fLIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt)); }
-            time_mSt=millis(); tim=0; 
+                rRIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt));  fLIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt)); servo_flush(); }
+            time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                fRIK(0,-tilt*sinf(tt),height); rLIK(0,-tilt*sinf(tt),height); }
+                fRIK(0,-tilt*sinf(tt),height); rLIK(0,-tilt*sinf(tt),height); servo_flush(); }
 
         }else if(Twerk){
             // Phase 1: Slow descent
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period*4){ tim=millis()-time_mSt; tt=(float)(tim*PI/2.0/(period*4));
                 fRIK(0,0,height-upHeight*sinf(tt)); fLIK(0,0,height-upHeight*sinf(tt));
-                rRIK(0,0,height+upHeight*sinf(tt)); rLIK(0,0,height+upHeight*sinf(tt)); }
-            
+                rRIK(0,0,height+upHeight*sinf(tt)); rLIK(0,0,height+upHeight*sinf(tt)); servo_flush(); }
+
             // Phase 2: The shake
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period*6){ tim=millis()-time_mSt; tt=(float)(tim*2.0*PI/period);
                 fRIK(0,0,height-upHeight); fLIK(0,0,height-upHeight);
-                rRIK(0,0,height+upHeight*(1.0f+0.5f*sinf(tt))); rLIK(0,0,height+upHeight*(1.0f+0.5f*sinf(tt))); }
-            
+                rRIK(0,0,height+upHeight*(1.0f+0.5f*sinf(tt))); rLIK(0,0,height+upHeight*(1.0f+0.5f*sinf(tt))); servo_flush(); }
+
             // Phase 3: Slow return
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period*4){ tim=millis()-time_mSt; tt=(float)(tim*PI/2.0/(period*4));
                 fRIK(0,0,height-upHeight*cosf(tt)); fLIK(0,0,height-upHeight*cosf(tt));
-                rRIK(0,0,height+upHeight*cosf(tt)); rLIK(0,0,height+upHeight*cosf(tt)); }
+                rRIK(0,0,height+upHeight*cosf(tt)); rLIK(0,0,height+upHeight*cosf(tt)); servo_flush(); }
 
         }else if(Jump){
-            float crouchZ = 35;
+            float crouchZ = 40;
             float pushZ   = 100;
             float tuckZ   = 45;
 
@@ -459,38 +511,41 @@ static void gait_task(void *arg){
             if(pushZ > 105)  pushZ = 105;
 
             // Phase 1: Deep crouch
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period*3){ tim=millis()-time_mSt; tt=(float)(tim*PI/2.0/(period*3));
                 float z = height - (height - crouchZ) * sinf(tt);
-                fRIK(0,0,z); fLIK(0,0,z); rRIK(0,0,z); rLIK(0,0,z); }
+                fRIK(0,0,z); fLIK(0,0,z); rRIK(0,0,z); rLIK(0,0,z); servo_flush(); }
 
             // Hold crouch
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period*2){ tim=millis()-time_mSt;
-                fRIK(0,0,crouchZ); fLIK(0,0,crouchZ); rRIK(0,0,crouchZ); rLIK(0,0,crouchZ); }
+                fRIK(0,0,crouchZ); fLIK(0,0,crouchZ); rRIK(0,0,crouchZ); rLIK(0,0,crouchZ); servo_flush(); }
 
-            // Phase 2: Explosive extension
+            // Phase 2: Explosive extension — force max speed on all legs
+            servo_speed_all(0);   // 0 = full speed = maximum pop
             fRIK(0,0,pushZ); fLIK(0,0,pushZ); rRIK(0,0,pushZ); rLIK(0,0,pushZ);
+            servo_flush();
             vTaskDelay(pdMS_TO_TICKS(200));
 
             // Phase 3: Quick tuck
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             int tuckMs = 80;
             while(tim<tuckMs){ tim=millis()-time_mSt;
                 float frac = (float)tim / (float)tuckMs;
                 float z = pushZ - (pushZ - tuckZ) * frac;
-                fRIK(0,0,z); fLIK(0,0,z); rRIK(0,0,z); rLIK(0,0,z); }
+                fRIK(0,0,z); fLIK(0,0,z); rRIK(0,0,z); rLIK(0,0,z); servo_flush(); }
 
             // Phase 4: Land / recover
-            time_mSt=millis(); tim=0; 
+            time_mSt=millis(); tim=0;
             while(tim<period*3){ tim=millis()-time_mSt; tt=(float)(tim*PI/2.0/(period*3));
                 float z = tuckZ + (height - tuckZ) * sinf(tt);
-                fRIK(0,0,z); fLIK(0,0,z); rRIK(0,0,z); rLIK(0,0,z); }
+                fRIK(0,0,z); fLIK(0,0,z); rRIK(0,0,z); rLIK(0,0,z); servo_flush(); }
 
             Jump = 0;
 
         }else{
             fRIK(0,0,height); rRIK(0,0,height); fLIK(0,0,height); rLIK(0,0,height);
+            servo_flush();
             vTaskDelay(1);  // Small yield to prevent watchdog
         }
     }
