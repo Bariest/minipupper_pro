@@ -31,40 +31,23 @@ static float L1 = 50, L2 = 56;
 
 static int Ini=0, Step=0, Roll=0, Pitch=0, Stretch=0;
 static int Advance=0, Back=0, Left=0, Right=0, TurnL=0, TurnR=0;
-static int Twerk=0, Jump=0;
+static int Twerk=0, Jump=0, JumpFwd=0, TestSpeed=0;
 
 static int period=80, height=70, upHeight=10, stride=10, tilt=10;
 
-/* ---------- sync write buffer ---------- */
-/* goal[1..12]       = target signal (0..1023) for each servo
-   goal_speed[1..12] = per-servo speed (0 = full/max speed)            */
 static uint16_t goal[13];
-static uint16_t goal_speed[13];                 // all start at 0 (full speed)
+static uint16_t goal_speed[13];
 static const uint8_t sync_ids[12] = {1,2,3,4,5,6,7,8,9,10,11,12};
 
-/* set the speed for ONE servo (call before servo_flush) */
 static inline void servo_speed(int ch, uint16_t spd){
     goal_speed[ch] = spd;
 }
-/* set the same speed for ALL servos */
 static inline void servo_speed_all(uint16_t spd){
     for(int i=1;i<=12;i++) goal_speed[i] = spd;
 }
 
-/* push positions + per-servo speeds to all 12 servos in ONE packet.
- *
- * IMPORTANT FIX:
- *  - This loop used to be hammered with no yield, which flooded the
- *    half-duplex servo bus and starved the idle task -> servos die while
- *    the ESP keeps running. We now pace it to ~5 ms/frame and yield, which
- *    mimics the natural pacing of the per-servo WritePos() version.
- *  - speed is sent as 0 (= max speed), exactly like WritePos(ch,sig,0,0).
- */
 static void servo_flush(void){
     static int64_t last_us = 0;
-
-    /* pace to ~5 ms per frame: never floods the bus, and vTaskDelay lets the
-       idle task run (feeds the watchdog) and lets the UART TX drain */
     while(esp_timer_get_time() - last_us < 5000){
         vTaskDelay(1);
     }
@@ -73,18 +56,17 @@ static void servo_flush(void){
     uint16_t pos[12], spd[12], tim[12];
     for(int i=0; i<12; i++){
         pos[i] = goal[i+1];
-        tim[i] = 0;                 /* time=0: no timed control */
-        spd[i] = goal_speed[i+1];   /* 0 == max speed, same as WritePos(ch,sig,0,0) */
+        tim[i] = 0;
+        spd[i] = goal_speed[i+1];
     }
     SyncWritePos((uint8_t*)sync_ids, 12, pos, tim, spd);
 }
 
-/* ---------- helpers ---------- */
 static inline uint32_t millis(void){ return (uint32_t)(esp_timer_get_time()/1000ULL); }
 
 static void reset_all_modes(void){
     Ini=Step=Roll=Pitch=Stretch=0;
-    Advance=Back=Left=Right=TurnL=TurnR=Twerk=Jump=0;
+    Advance=Back=Left=Right=TurnL=TurnR=Twerk=Jump=JumpFwd=TestSpeed=0; // <-- add TestSpeed here
 }
 
 static void nvs_put_float(const char*k, float v){
@@ -99,8 +81,6 @@ static void nvs_put_int(const char*k, int v){
     nvs_set_i32(nvs,k,v); nvs_commit(nvs);
 }
 
-/* ---------- servo + IK ---------- */
-/* NOTE: only stores into goal[]; transmission happens in servo_flush() */
 static void servo_write(int ch, float ang){
     int sig = 511 + (int)(ang / 0.263f);
     if(sig<0) sig=0;
@@ -148,7 +128,6 @@ static void rLIK(float x,float th0,float z){
     servo_write(12,-(th2*180.0f/PI)+ offset[12]);
 }
 
-/* ---------- HTML page ---------- */
 static esp_err_t send_root(httpd_req_t *req){
     char *b = malloc(12000);
     if(!b) return ESP_ERR_NO_MEM;
@@ -188,7 +167,12 @@ static esp_err_t send_root(httpd_req_t *req){
     A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
       "style=\"background:#e67e22;\"><a href=\"/jump\" style=\"color:white;\">&#11014; Jump</a>"
       "</button></div>", ON(Jump));
-
+    A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
+      "style=\"background:#27ae60;\"><a href=\"/jumpfwd\" style=\"color:white;\">&#8599; Jump Fwd</a>"
+      "</button></div>", ON(JumpFwd));
+    A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
+      "style=\"background:#2980b9;\"><a href=\"/testspeed\" style=\"color:white;\">&#9881; Test Speed</a>"
+      "</button></div>", ON(TestSpeed));
     A("period (msec)<br><a class=\"pm\" href=\"/periodM\">-</a><span>%d</span>"
       "<a class=\"pm\" href=\"/periodP\">+</a><br>", period);
     A("height (mm)<br><a class=\"pm\" href=\"/heightM\">-</a><span>%d</span>"
@@ -228,7 +212,6 @@ static esp_err_t send_root(httpd_req_t *req){
     return ESP_OK;
 }
 
-/* ---------- handlers ---------- */
 #define MOTION(name, var) \
 static esp_err_t name(httpd_req_t*r){ \
     if(var){var=0;reset_all_modes();} else {reset_all_modes();var=1;} \
@@ -238,6 +221,8 @@ MOTION(h_pitch,Pitch) MOTION(h_stretch,Stretch) MOTION(h_ad,Advance)
 MOTION(h_back,Back) MOTION(h_left,Left)   MOTION(h_right,Right)
 MOTION(h_turnL,TurnL) MOTION(h_turnR,TurnR) MOTION(h_twerk,Twerk)
 MOTION(h_jump,Jump)
+MOTION(h_jumpfwd,JumpFwd)
+MOTION(h_testspeed,TestSpeed)
 
 static esp_err_t h_root(httpd_req_t*r){ return send_root(r); }
 
@@ -278,7 +263,7 @@ static void start_webserver(void){
     httpd_config_t cfg=HTTPD_DEFAULT_CONFIG();
     cfg.max_uri_handlers=60;
     cfg.stack_size=8192;
-    cfg.core_id = 0;  // Pin HTTP server to core 0
+    cfg.core_id = 0;
     cfg.lru_purge_enable=true;
     ESP_ERROR_CHECK(httpd_start(&s,&cfg));
 
@@ -287,7 +272,7 @@ static void start_webserver(void){
     reg(s,"/pitch",h_pitch); reg(s,"/stretch",h_stretch);
     reg(s,"/ad",h_ad);       reg(s,"/back",h_back);   reg(s,"/left",h_left);
     reg(s,"/right",h_right); reg(s,"/turnL",h_turnL); reg(s,"/turnR",h_turnR);
-    reg(s,"/twerk",h_twerk); reg(s,"/jump",h_jump);
+    reg(s,"/twerk",h_twerk); reg(s,"/jump",h_jump); reg(s,"/jumpfwd",h_jumpfwd); reg(s,"/testspeed",h_testspeed);
     reg(s,"/periodM",h_periodM); reg(s,"/periodP",h_periodP);
     reg(s,"/heightM",h_heightM); reg(s,"/heightP",h_heightP);
     reg(s,"/upHeightM",h_upM);   reg(s,"/upHeightP",h_upP);
@@ -301,7 +286,6 @@ static void start_webserver(void){
     }
 }
 
-/* ---------- WiFi softAP with fixed IP ---------- */
 static void wifi_init_softap(void){
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
@@ -329,24 +313,21 @@ static void wifi_init_softap(void){
     ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ac));
     ESP_ERROR_CHECK(esp_wifi_start());
 
-    // *** DISABLE WIFI POWER SAVING TO REDUCE LAG ***
     esp_wifi_set_ps(WIFI_PS_NONE);
 
     ESP_LOGI(TAG, "AP started: 192.168.55.22");
 }
 
-/* ---------- gait task (matches Arduino loop exactly) ---------- */
 static void gait_task(void *arg){
     float tim, tt;
     uint32_t time_mSt;
 
-    /* start with all servos centered + ALL SPEEDS = 0 (full speed) */
     for(int i=1;i<=12;i++) goal[i] = 511;
-    servo_speed_all(0);          // <<< everything defaults to 0 here
+    servo_speed_all(0);
 
     for(;;){
         if(Ini){
-            servo_speed_all(0);  // keep full speed (change here if you want slow homing)
+            servo_speed_all(0);
             for(int i=1; i<=12; i++) servo_write(i, offset[i]);
             servo_flush();
             vTaskDelay(1);
@@ -484,19 +465,14 @@ static void gait_task(void *arg){
                 fRIK(0,-tilt*sinf(tt),height); rLIK(0,-tilt*sinf(tt),height); servo_flush(); }
 
         }else if(Twerk){
-            // Phase 1: Slow descent
             time_mSt=millis(); tim=0;
             while(tim<period*4){ tim=millis()-time_mSt; tt=(float)(tim*PI/2.0/(period*4));
                 fRIK(0,0,height-upHeight*sinf(tt)); fLIK(0,0,height-upHeight*sinf(tt));
                 rRIK(0,0,height+upHeight*sinf(tt)); rLIK(0,0,height+upHeight*sinf(tt)); servo_flush(); }
-
-            // Phase 2: The shake
             time_mSt=millis(); tim=0;
             while(tim<period*6){ tim=millis()-time_mSt; tt=(float)(tim*2.0*PI/period);
                 fRIK(0,0,height-upHeight); fLIK(0,0,height-upHeight);
                 rRIK(0,0,height+upHeight*(1.0f+0.5f*sinf(tt))); rLIK(0,0,height+upHeight*(1.0f+0.5f*sinf(tt))); servo_flush(); }
-
-            // Phase 3: Slow return
             time_mSt=millis(); tim=0;
             while(tim<period*4){ tim=millis()-time_mSt; tt=(float)(tim*PI/2.0/(period*4));
                 fRIK(0,0,height-upHeight*cosf(tt)); fLIK(0,0,height-upHeight*cosf(tt));
@@ -507,54 +483,154 @@ static void gait_task(void *arg){
             float pushZ   = 105;
             float tuckZ   = 45;
 
-            // --- Phase 1: Crouch (faster ramp down) ---
             time_mSt=millis(); tim=0;
             while(tim<period*2){ tim=millis()-time_mSt;
                 tt = (float)(tim * PI / 2.0 / (period*2));
                 float z = height - (height - crouchZ) * sinf(tt);
                 fRIK(0,0,z); fLIK(0,0,z); rRIK(0,0,z); rLIK(0,0,z); servo_flush(); }
-
-            // --- Brief settle: just enough for all 12 servos to reach crouchZ ---
             time_mSt=millis(); tim=0;
             while(tim<20){ tim=millis()-time_mSt;
                 fRIK(0,0,crouchZ); fLIK(0,0,crouchZ); rRIK(0,0,crouchZ); rLIK(0,0,crouchZ); servo_flush(); }
 
-            // --- Phase 2: Explosive extension, sent TWICE for bus reliability ---
             servo_speed_all(0);
             fRIK(0,0,pushZ); fLIK(0,0,pushZ); rRIK(0,0,pushZ); rLIK(0,0,pushZ);
             servo_flush();
-            servo_flush(); // second packet: if one servo missed it, it catches it here
-
-            // Airborne window scaled to crouch depth: deeper = longer flight time
-            int airMs = (int)(160.0f + (70.0f - crouchZ) * 1.0f); // around 190ish ADJUST THE 160F
+            servo_flush();
+            int airMs = (int)(160.0f + (70.0f - crouchZ) * 1.0f);
             vTaskDelay(pdMS_TO_TICKS(airMs));
 
-            // --- Phase 3: Smooth tuck using sinf (was linear) ---
             time_mSt=millis(); tim=0;
-            int tuckMs = 60;
+            int tuckMs = 50;
             while(tim<tuckMs){ tim=millis()-time_mSt;
-                float frac = sinf((float)tim * PI / 2.0f / (float)tuckMs); // smooth, not linear
+                float frac = sinf((float)tim * PI / 2.0f / (float)tuckMs);
                 float z = pushZ - (pushZ - tuckZ) * frac;
                 fRIK(0,0,z); fLIK(0,0,z); rRIK(0,0,z); rLIK(0,0,z); servo_flush(); }
 
-            // --- Phase 4: Soft landing recovery ---
             time_mSt=millis(); tim=0;
             while(tim<period*3){ tim=millis()-time_mSt;
                 tt = (float)(tim * PI / 2.0 / (period*3));
                 float z = tuckZ + (height - tuckZ) * sinf(tt);
                 fRIK(0,0,z); fLIK(0,0,z); rRIK(0,0,z); rLIK(0,0,z); servo_flush(); }
 
-            Jump = 0;  
+            Jump = 0;
+
+        }else if(JumpFwd){
+            float crouchZrear  = 60;
+            float crouchZfront = 40;
+            float pushZ        = 105;
+            float tuckZ        = 45;
+            float landZ        = height;
+
+            // ----------------------------------------------------------------
+            // Phase 1: CONTROLLED CROUCH
+            //   Medium speed (70) so it looks like the dog is deliberately
+            //   loading up energy rather than just falling down fast.
+            // ----------------------------------------------------------------
+            // Phase 1: CONTROLLED CROUCH
+            //   Medium speed (100) so it looks like the dog is deliberately
+            //   loading up energy rather than just falling down fast.
+            // ----------------------------------------------------------------
+            servo_speed_all(100);   // NOW this actually controls how slow it lowers
+            fRIK(0,0,crouchZfront); fLIK(0,0,crouchZfront);
+            rRIK(0,0,crouchZrear);  rLIK(0,0,crouchZrear);
+            servo_flush();
+            vTaskDelay(pdMS_TO_TICKS(900));  // give it time to travel slowly
+            // Brief settle so every servo actually reaches its crouch pose
+            time_mSt=millis(); tim=0;
+            while(tim<25){ tim=millis()-time_mSt;
+                fRIK(0,0,crouchZfront); fLIK(0,0,crouchZfront);
+                rRIK(0,0,crouchZrear);  rLIK(0,0,crouchZrear);
+                servo_flush(); }
+
+            // ----------------------------------------------------------------
+            // Phase 2: EXPLOSIVE EXTENSION — max speed (0)
+            //   The speed contrast with the slow crouch is what makes this
+            //   feel snappy. Two packets for bus reliability.
+            // ----------------------------------------------------------------
+            servo_speed_all(0);
+            fRIK(0,0,pushZ); fLIK(0,0,pushZ);
+            rRIK(0,0,pushZ); rLIK(0,0,pushZ);
+            servo_flush();
+            servo_flush();
+
+            // Airborne window
+            int airMs = (int)(160.0f + (70.0f - crouchZrear) * 1.0f);
+            vTaskDelay(pdMS_TO_TICKS(airMs));
+
+            // ----------------------------------------------------------------
+            // Phase 3: POUNCE TUCK — still max speed (0)
+            //   Must stay fast: we're airborne and need legs repositioned
+            //   before the dog hits the ground.
+            //   Rear tucks first while front stays reaching → pounce look.
+            // ----------------------------------------------------------------
+            // servo_speed already 0 from Phase 2, no need to set again
+            time_mSt=millis(); tim=0;
+            int rearTuckMs = 45;
+            while(tim<rearTuckMs){ tim=millis()-time_mSt;
+                float frac = sinf((float)tim * PI / 2.0f / (float)rearTuckMs);
+                float zr = pushZ - (pushZ - tuckZ) * frac;
+                rRIK(0,0,zr); rLIK(0,0,zr);
+                fRIK(0,0,pushZ); fLIK(0,0,pushZ);
+                servo_flush(); }
+
+            time_mSt=millis(); tim=0;
+            int frontTuckMs = 45;
+            while(tim<frontTuckMs){ tim=millis()-time_mSt;
+                float frac = sinf((float)tim * PI / 2.0f / (float)frontTuckMs);
+                float zf = pushZ - (pushZ - tuckZ) * frac;
+                fRIK(0,0,zf); fLIK(0,0,zf);
+                rRIK(0,0,tuckZ); rLIK(0,0,tuckZ);
+                servo_flush(); }
+
+            // ----------------------------------------------------------------
+            // Phase 4: SOFT LANDING RECOVERY — slower speed (250)
+            //   Legs extend gently to absorb the impact instead of snapping
+            //   down hard. Looks springy, like the dog sticks the landing.
+            // ----------------------------------------------------------------
+            // Phase 4: SOFT LANDING — one command, servo speed controls how fast it arrives
+            servo_speed_all(0);    // NOW this actually does something
+            fRIK(0,0,height); fLIK(0,0,height);
+            rRIK(0,0,height); rLIK(0,0,height);
+            servo_flush();
+            vTaskDelay(pdMS_TO_TICKS(period * 4));  // wait for it to finish travelling
+            // Always reset to max speed so other motions are unaffected
+            servo_speed_all(0);
+            JumpFwd = 0;
+        }else if(TestSpeed){
+            ESP_LOGI(TAG, "--- Speed Test START ---");
+
+            // Step 1: go to a neutral mid position at max speed
+            servo_speed_all(2047);
+            fRIK(0,0,70); fLIK(0,0,70); rRIK(0,0,70); rLIK(0,0,70);
+            servo_flush();
+            vTaskDelay(pdMS_TO_TICKS(1500));
+
+            // Step 2: move to a lower position SLOWLY — you should see it creep down
+            ESP_LOGI(TAG, "Moving SLOW (speed=30)");
+            servo_speed_all(30);
+            fRIK(0,0,100); fLIK(0,0,100); rRIK(0,0,100); rLIK(0,0,100);
+            servo_flush();
+            vTaskDelay(pdMS_TO_TICKS(3000));   // watch it move slowly
+
+            // Step 3: snap back FAST — you should see it jump back instantly
+            ESP_LOGI(TAG, "Moving FAST (speed=2047)");
+            servo_speed_all(2047);
+            fRIK(0,0,70); fLIK(0,0,70); rRIK(0,0,70); rLIK(0,0,70);
+            servo_flush();
+            vTaskDelay(pdMS_TO_TICKS(2000));   // watch it snap back
+
+            ESP_LOGI(TAG, "--- Speed Test DONE ---");
+            servo_speed_all(0);
+            TestSpeed = 0;   // auto-clears after one run
 
         }else{
             fRIK(0,0,height); rRIK(0,0,height); fLIK(0,0,height); rLIK(0,0,height);
             servo_flush();
-            vTaskDelay(1);  // Small yield to prevent watchdog
+            vTaskDelay(1);
         }
     }
 }
 
-/* ---------- entry ---------- */
 void app_main(void){
     esp_err_t r = nvs_flash_init();
     if(r==ESP_ERR_NVS_NO_FREE_PAGES || r==ESP_ERR_NVS_NEW_VERSION_FOUND){
@@ -577,6 +653,5 @@ void app_main(void){
     wifi_init_softap();
     start_webserver();
 
-    // *** HIGH PRIORITY GAIT TASK ON CORE 1 ***
     xTaskCreatePinnedToCore(gait_task, "gait", 8192, NULL, 22, NULL, 1);
 }
