@@ -2,6 +2,7 @@
 #include <string.h>
 #include <math.h>
 #include <stdlib.h>
+#include <ctype.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -16,6 +17,7 @@
 #include "lwip/ip4_addr.h"
 #include "driver/gpio.h"
 #include "SCServo.h"
+#include "mqtt_client.h"
 
 #define TAG "PUPPER"
 #define PI 3.14159265358979f
@@ -24,6 +26,14 @@
 #define SERVO_RX_PIN    5
 #define SERVO_BAUD_RATE 1000000
 
+// ---- WiFi (station) + MQTT configuration ----
+// Fill these in for your network / broker before flashing.
+#define WIFI_SSID        "Mangdang"
+#define WIFI_PASS        "mangdang"
+#define MQTT_BROKER_URI  "mqtt://192.168.1.117:1883"
+#define MQTT_CMD_TOPIC   "minipupper/cmd"
+#define MQTT_STATE_TOPIC "minipupper/state"
+
 static nvs_handle_t nvs;
 
 static float offset[13] = {0};
@@ -31,7 +41,7 @@ static float L1 = 50, L2 = 56;
 
 static int Ini=0, Step=0, Roll=0, Pitch=0, Stretch=0;
 static int Advance=0, Back=0, Left=0, Right=0, TurnL=0, TurnR=0;
-static int Twerk=0, Jump=0, JumpFwd=0, TestSpeed=0;
+static int Twerk=0, Jump=0, JumpFwd=0, TestSpeed=0, Mate=0;
 
 static int period=80, height=70, upHeight=10, stride=10, tilt=10;
 
@@ -66,8 +76,28 @@ static inline uint32_t millis(void){ return (uint32_t)(esp_timer_get_time()/1000
 
 static void reset_all_modes(void){
     Ini=Step=Roll=Pitch=Stretch=0;
-    Advance=Back=Left=Right=TurnL=TurnR=Twerk=Jump=JumpFwd=TestSpeed=0; // <-- add TestSpeed here
+    Advance=Back=Left=Right=TurnL=TurnR=Twerk=Jump=JumpFwd=TestSpeed=Mate=0; // <-- add TestSpeed here
 }
+
+// Toggle a motion flag the same way the web buttons do: pressing the
+// active motion's button turns it off, pressing any other turns that
+// one on (and everything else off).
+static void toggle_motion(int *flag){
+    if(*flag){ *flag=0; reset_all_modes(); }
+    else     { reset_all_modes(); *flag=1; }
+}
+
+// Command name -> flag table, shared between the web UI and MQTT.
+typedef struct { const char *name; int *flag; } motion_cmd_t;
+static const motion_cmd_t motion_cmds[] = {
+    {"ini",       &Ini},      {"step",      &Step},     {"roll",   &Roll},
+    {"pitch",     &Pitch},    {"stretch",   &Stretch},  {"advance",&Advance},
+    {"back",      &Back},     {"left",      &Left},     {"right",  &Right},
+    {"turnl",     &TurnL},    {"turnr",     &TurnR},    {"twerk",  &Twerk},
+    {"jump",      &Jump},     {"jumpfwd",   &JumpFwd},  {"testspeed",&TestSpeed},
+    {"mate",      &Mate},
+};
+#define MOTION_CMD_COUNT (sizeof(motion_cmds)/sizeof(motion_cmds[0]))
 
 static void nvs_put_float(const char*k, float v){
     nvs_set_blob(nvs, k, &v, sizeof(float)); nvs_commit(nvs);
@@ -173,6 +203,9 @@ static esp_err_t send_root(httpd_req_t *req){
     A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
       "style=\"background:#2980b9;\"><a href=\"/testspeed\" style=\"color:white;\">&#9881; Test Speed</a>"
       "</button></div>", ON(TestSpeed));
+    A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
+      "style=\"background:#c0392b;\"><a href=\"/mate\" style=\"color:white;\">&#10084; Mate</a>"
+      "</button></div>", ON(Mate));
     A("period (msec)<br><a class=\"pm\" href=\"/periodM\">-</a><span>%d</span>"
       "<a class=\"pm\" href=\"/periodP\">+</a><br>", period);
     A("height (mm)<br><a class=\"pm\" href=\"/heightM\">-</a><span>%d</span>"
@@ -214,8 +247,11 @@ static esp_err_t send_root(httpd_req_t *req){
 
 #define MOTION(name, var) \
 static esp_err_t name(httpd_req_t*r){ \
-    if(var){var=0;reset_all_modes();} else {reset_all_modes();var=1;} \
-    return send_root(r); }
+    uint32_t t0 = millis(); \
+    toggle_motion(&var); \
+    esp_err_t ret = send_root(r); \
+    ESP_LOGI(TAG, "HTTP %s handled in %lu ms", r->uri, (unsigned long)(millis()-t0)); \
+    return ret; }
 MOTION(h_ini,Ini)   MOTION(h_step,Step)   MOTION(h_roll,Roll)
 MOTION(h_pitch,Pitch) MOTION(h_stretch,Stretch) MOTION(h_ad,Advance)
 MOTION(h_back,Back) MOTION(h_left,Left)   MOTION(h_right,Right)
@@ -223,6 +259,7 @@ MOTION(h_turnL,TurnL) MOTION(h_turnR,TurnR) MOTION(h_twerk,Twerk)
 MOTION(h_jump,Jump)
 MOTION(h_jumpfwd,JumpFwd)
 MOTION(h_testspeed,TestSpeed)
+MOTION(h_mate,Mate)
 
 static esp_err_t h_root(httpd_req_t*r){ return send_root(r); }
 
@@ -273,6 +310,7 @@ static void start_webserver(void){
     reg(s,"/ad",h_ad);       reg(s,"/back",h_back);   reg(s,"/left",h_left);
     reg(s,"/right",h_right); reg(s,"/turnL",h_turnL); reg(s,"/turnR",h_turnR);
     reg(s,"/twerk",h_twerk); reg(s,"/jump",h_jump); reg(s,"/jumpfwd",h_jumpfwd); reg(s,"/testspeed",h_testspeed);
+    reg(s,"/mate",h_mate);
     reg(s,"/periodM",h_periodM); reg(s,"/periodP",h_periodP);
     reg(s,"/heightM",h_heightM); reg(s,"/heightP",h_heightP);
     reg(s,"/upHeightM",h_upM);   reg(s,"/upHeightP",h_upP);
@@ -286,36 +324,79 @@ static void start_webserver(void){
     }
 }
 
-static void wifi_init_softap(void){
+static esp_mqtt_client_handle_t mqtt_client = NULL;
+
+static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data){
+    esp_mqtt_event_handle_t event = (esp_mqtt_event_handle_t)event_data;
+    switch(event_id){
+        case MQTT_EVENT_CONNECTED:
+            ESP_LOGI(TAG, "MQTT connected, subscribing to %s", MQTT_CMD_TOPIC);
+            esp_mqtt_client_subscribe(mqtt_client, MQTT_CMD_TOPIC, 0);
+            break;
+        case MQTT_EVENT_DATA: {
+            char cmd[32] = {0};
+            int len = event->data_len < (int)sizeof(cmd)-1 ? event->data_len : (int)sizeof(cmd)-1;
+            memcpy(cmd, event->data, len);
+            for(int i=0;i<len;i++) cmd[i] = (char)tolower((unsigned char)cmd[i]);
+
+            for(size_t i=0;i<MOTION_CMD_COUNT;i++){
+                if(strcmp(cmd, motion_cmds[i].name)==0){
+                    toggle_motion(motion_cmds[i].flag);
+                    esp_mqtt_client_publish(mqtt_client, MQTT_STATE_TOPIC, cmd, 0, 0, 0);
+                    break;
+                }
+            }
+            break;
+        }
+        default: break;
+    }
+}
+
+static void mqtt_app_start(void){
+    esp_mqtt_client_config_t mqtt_cfg = {
+        .broker.address.uri = MQTT_BROKER_URI,
+    };
+    mqtt_client = esp_mqtt_client_init(&mqtt_cfg);
+    esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
+    esp_mqtt_client_start(mqtt_client);
+}
+
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data){
+    if(event_base==WIFI_EVENT && event_id==WIFI_EVENT_STA_START){
+        esp_wifi_connect();
+    }else if(event_base==WIFI_EVENT && event_id==WIFI_EVENT_STA_DISCONNECTED){
+        ESP_LOGW(TAG, "WiFi disconnected, reconnecting...");
+        esp_wifi_connect();
+    }else if(event_base==IP_EVENT && event_id==IP_EVENT_STA_GOT_IP){
+        ip_event_got_ip_t *event = (ip_event_got_ip_t*)event_data;
+        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+        mqtt_app_start();
+    }
+}
+
+static void wifi_init_sta(void){
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_t* ap = esp_netif_create_default_wifi_ap();
-
-    esp_netif_ip_info_t ipinfo;
-    IP4_ADDR(&ipinfo.ip,      192,168,55,22);
-    IP4_ADDR(&ipinfo.gw,      192,168,55,22);
-    IP4_ADDR(&ipinfo.netmask, 255,255,255,0);
-    esp_netif_dhcps_stop(ap);
-    esp_netif_set_ip_info(ap, &ipinfo);
-    esp_netif_dhcps_start(ap);
+    esp_netif_create_default_wifi_sta();
 
     wifi_init_config_t wcfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&wcfg));
 
-    wifi_config_t ac = {0};
-    strcpy((char*)ac.ap.ssid, "MiniPupper2");
-    ac.ap.ssid_len = strlen("MiniPupper2");
-    strcpy((char*)ac.ap.password, "password");
-    ac.ap.max_connection = 4;
-    ac.ap.authmode = WIFI_AUTH_WPA2_PSK;
+    ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL));
 
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_AP, &ac));
+    wifi_config_t sc = {0};
+    strncpy((char*)sc.sta.ssid, WIFI_SSID, sizeof(sc.sta.ssid)-1);
+    strncpy((char*)sc.sta.password, WIFI_PASS, sizeof(sc.sta.password)-1);
+    sc.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sc));
     ESP_ERROR_CHECK(esp_wifi_start());
 
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    ESP_LOGI(TAG, "AP started: 192.168.55.22");
+    ESP_LOGI(TAG, "Connecting to WiFi SSID: %s", WIFI_SSID);
 }
 
 static void gait_task(void *arg){
@@ -465,18 +546,37 @@ static void gait_task(void *arg){
                 fRIK(0,-tilt*sinf(tt),height); rLIK(0,-tilt*sinf(tt),height); servo_flush(); }
 
         }else if(Twerk){
+            // Fast up/down vibration: one quick full cycle per pass, which
+            // the outer loop repeats continuously while Twerk is held.
+            // Front and rear bounce in opposite phase for a bigger shake.
+            float twerkAmp  = upHeight * 1.0f;
+            float frontAmp  = upHeight * 0.6f;  // front legs bounce less than rear
+            float zLo = 15.0f, zHi = 100.0f; // keep within safe leg reach
+
+            servo_speed_all(300); // slower servo travel for a gentler shake
             time_mSt=millis(); tim=0;
-            while(tim<period*4){ tim=millis()-time_mSt; tt=(float)(tim*PI/2.0/(period*4));
-                fRIK(0,0,height-upHeight*sinf(tt)); fLIK(0,0,height-upHeight*sinf(tt));
-                rRIK(0,0,height+upHeight*sinf(tt)); rLIK(0,0,height+upHeight*sinf(tt)); servo_flush(); }
+            while(tim<period*5){ tim=millis()-time_mSt; tt=(float)(tim*2.0*PI/(period*5));
+                float zf = fmaxf(zLo, fminf(zHi, height - frontAmp*sinf(tt)));
+                float zr = fmaxf(zLo, fminf(zHi, height + twerkAmp*sinf(tt)));
+                fRIK(0,0,zf); fLIK(0,0,zf);
+                rRIK(0,0,zr); rLIK(0,0,zr); servo_flush(); }
+
+        }else if(Mate){
+            // Front legs stand tall and stay still; rear end thrusts up/down.
+            float frontZ   = 90.0f;          // raised front stance, held fixed
+            float rearMidZ = 50.0f;          // rear sits lower -> mounting posture
+            float rearAmp  = upHeight * 1.5f;
+            float zLo = 15.0f, zHi = 100.0f; // keep within safe leg reach
+
+            servo_speed_all(400);
+            fRIK(0,0,frontZ); fLIK(0,0,frontZ);
+            servo_flush();
+
             time_mSt=millis(); tim=0;
-            while(tim<period*6){ tim=millis()-time_mSt; tt=(float)(tim*2.0*PI/period);
-                fRIK(0,0,height-upHeight); fLIK(0,0,height-upHeight);
-                rRIK(0,0,height+upHeight*(1.0f+0.5f*sinf(tt))); rLIK(0,0,height+upHeight*(1.0f+0.5f*sinf(tt))); servo_flush(); }
-            time_mSt=millis(); tim=0;
-            while(tim<period*4){ tim=millis()-time_mSt; tt=(float)(tim*PI/2.0/(period*4));
-                fRIK(0,0,height-upHeight*cosf(tt)); fLIK(0,0,height-upHeight*cosf(tt));
-                rRIK(0,0,height+upHeight*cosf(tt)); rLIK(0,0,height+upHeight*cosf(tt)); servo_flush(); }
+            while(tim<period*3){ tim=millis()-time_mSt; tt=(float)(tim*2.0*PI/(period*3));
+                float zr = fmaxf(zLo, fminf(zHi, rearMidZ + rearAmp*sinf(tt)));
+                fRIK(0,0,frontZ); fLIK(0,0,frontZ);
+                rRIK(0,0,zr); rLIK(0,0,zr); servo_flush(); }
 
         }else if(Jump){
             float crouchZ = 40;
@@ -552,6 +652,17 @@ static void gait_task(void *arg){
             rRIK(0,0,pushZ); rLIK(0,0,pushZ);
             servo_flush();
             servo_flush();
+
+            // Read torque (load %) and current (mA) on the rear knee servos
+            // right at the moment of the push, to see how hard they're working.
+            {
+                int fb9  = FeedBack(9);
+                int err9 = getLastError();
+                ESP_LOGI(TAG, "JumpFwd push RR knee: fb=%d err=%d load=%d cur=%dmA", fb9, err9, ReadLoad(-1), ReadCurrent(-1));
+                int fb12 = FeedBack(12);
+                int err12 = getLastError();
+                ESP_LOGI(TAG, "JumpFwd push RL knee: fb=%d err=%d load=%d cur=%dmA", fb12, err12, ReadLoad(-1), ReadCurrent(-1));
+            }
 
             // Airborne window
             int airMs = (int)(160.0f + (70.0f - crouchZrear) * 1.0f);
@@ -650,7 +761,7 @@ void app_main(void){
     for(int i=1;i<=12;i++){ char k[12]; snprintf(k,sizeof k,"offset%d",i);
         offset[i]=nvs_get_float(k, offset[i]); }
 
-    wifi_init_softap();
+    wifi_init_sta();
     start_webserver();
 
     xTaskCreatePinnedToCore(gait_task, "gait", 8192, NULL, 22, NULL, 1);
