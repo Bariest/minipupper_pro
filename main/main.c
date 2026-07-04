@@ -16,15 +16,24 @@
 #include "esp_netif.h"
 #include "lwip/ip4_addr.h"
 #include "driver/gpio.h"
-#include "SCServo.h"
+#include "driver_board.h"   // SPI controller-driver-board backend (replaces SCServo)
 #include "mqtt_client.h"
 
 #define TAG "PUPPER"
 #define PI 3.14159265358979f
 
-#define SERVO_TX_PIN    4
-#define SERVO_RX_PIN    5
-#define SERVO_BAUD_RATE 1000000
+/* ---- legacy "speed" -> current(mA) limit mapping (new driver board) ----
+ * The driver board does POSITION control with a current/torque CAP; it has no
+ * speed field. Feetech convention used by the gait code: goal_speed 0 == "max
+ * speed". We translate every legacy speed value into a current limit:
+ *   speed 0      -> CUR_MAX_MA   (full torque / snap)
+ *   speed 1..ref -> CUR_MIN_MA .. CUR_MAX_MA  (gentler/slower = lower cap)
+ * NOTE: this is a CAP, not a forced draw. A lightly loaded leg only sources the
+ * current it needs to hold its position; the cap just limits peak/stall current.
+ * Tune these three constants for your SCS0009 servos. */
+#define CUR_MAX_MA   1200
+
+static inline uint16_t speed_to_current_mA(uint16_t spd){ (void)spd; return CUR_MAX_MA; }
 
 // ---- WiFi (station) + MQTT configuration ----
 // Fill these in for your network / broker before flashing.
@@ -46,8 +55,12 @@ static int Twerk=0, Jump=0, JumpFwd=0, TestSpeed=0, Mate=0;
 static int period=80, height=70, upHeight=10, stride=10, tilt=10;
 
 static uint16_t goal[13];
-static uint16_t goal_speed[13];
-static const uint8_t sync_ids[12] = {1,2,3,4,5,6,7,8,9,10,11,12};
+static uint16_t goal_speed[13];   // legacy "speed" units; converted to mA on flush
+
+// Manual override for servo 8 (Rear Right shoulder). When manual8 is set the
+// gait task holds a neutral stand but drives servo 8 to manual8_pos.
+static int manual8 = 0;
+static uint16_t manual8_pos = 511;   // SCS position 0..1023 (511 = centre)
 
 static inline void servo_speed(int ch, uint16_t spd){
     goal_speed[ch] = spd;
@@ -63,13 +76,12 @@ static void servo_flush(void){
     }
     last_us = esp_timer_get_time();
 
-    uint16_t pos[12], spd[12], tim[12];
+    uint16_t pos[12], cur[12];
     for(int i=0; i<12; i++){
         pos[i] = goal[i+1];
-        tim[i] = 0;
-        spd[i] = goal_speed[i+1];
+        cur[i] = speed_to_current_mA(goal_speed[i+1]);  // speed -> current limit (mA)
     }
-    SyncWritePos((uint8_t*)sync_ids, 12, pos, tim, spd);
+    driver_board_sync_write(pos, cur);
 }
 
 static inline uint32_t millis(void){ return (uint32_t)(esp_timer_get_time()/1000ULL); }
@@ -77,6 +89,7 @@ static inline uint32_t millis(void){ return (uint32_t)(esp_timer_get_time()/1000
 static void reset_all_modes(void){
     Ini=Step=Roll=Pitch=Stretch=0;
     Advance=Back=Left=Right=TurnL=TurnR=Twerk=Jump=JumpFwd=TestSpeed=Mate=0; // <-- add TestSpeed here
+    manual8=0;
 }
 
 // Toggle a motion flag the same way the web buttons do: pressing the
@@ -206,6 +219,12 @@ static esp_err_t send_root(httpd_req_t *req){
     A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
       "style=\"background:#c0392b;\"><a href=\"/mate\" style=\"color:white;\">&#10084; Mate</a>"
       "</button></div>", ON(Mate));
+    A("<div style=\"margin:8px auto;\"><form action=\"/leg8\" method=\"get\" "
+      "style=\"display:inline;\">Leg 8 pos (0-1023): "
+      "<input type=\"number\" name=\"v\" value=\"%d\" min=\"0\" max=\"1023\" "
+      "style=\"width:80px;height:34px;\"><button type=\"submit\" "
+      "style=\"width:110px;background:%s;color:white;\">Set Leg 8</button>"
+      "</form></div>", manual8_pos, manual8?"lime":"#555");
     A("period (msec)<br><a class=\"pm\" href=\"/periodM\">-</a><span>%d</span>"
       "<a class=\"pm\" href=\"/periodP\">+</a><br>", period);
     A("height (mm)<br><a class=\"pm\" href=\"/heightM\">-</a><span>%d</span>"
@@ -290,6 +309,21 @@ static esp_err_t h_calReset(httpd_req_t*r){
     return send_root(r);
 }
 
+// /leg8?v=NNN  -> hold servo 8 at raw SCS position NNN (0..1023, 511=centre)
+static esp_err_t h_leg8(httpd_req_t*r){
+    char q[32], val[8];
+    if(httpd_req_get_url_query_str(r,q,sizeof q)==ESP_OK &&
+       httpd_query_key_value(q,"v",val,sizeof val)==ESP_OK){
+        int p=atoi(val);
+        if(p<0) p=0;
+        if(p>1023) p=1023;
+        reset_all_modes();
+        manual8_pos=(uint16_t)p;
+        manual8=1;
+    }
+    return send_root(r);
+}
+
 static void reg(httpd_handle_t s,const char*uri,esp_err_t(*h)(httpd_req_t*)){
     httpd_uri_t u={.uri=uri,.method=HTTP_GET,.handler=h};
     httpd_register_uri_handler(s,&u);
@@ -317,6 +351,7 @@ static void start_webserver(void){
     reg(s,"/strideM",h_strM);    reg(s,"/strideP",h_strP);
     reg(s,"/tiltM",h_tiltM);     reg(s,"/tiltP",h_tiltP);
     reg(s,"/calReset",h_calReset);
+    reg(s,"/leg8",h_leg8);
     char uri[12];
     for(int i=1;i<=12;i++){
         snprintf(uri,sizeof uri,"/cal%dM",i); reg(s,strdup(uri),h_cal);
@@ -462,6 +497,13 @@ static void gait_task(void *arg){
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(-stride*sinf(tt),0,height);                   rLIK(-stride*sinf(tt),0,height);
                 rRIK( stride*sinf(tt),0,height-upHeight*cosf(tt)); fLIK( stride*sinf(tt),0,height-upHeight*cosf(tt)); servo_flush(); }
+            ESP_LOGI(TAG, "cur(mA): 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 7=%d 8=%d 9=%d 10=%d 11=%d 12=%d",
+                driver_board_present_current(1),  driver_board_present_current(2),
+                driver_board_present_current(3),  driver_board_present_current(4),
+                driver_board_present_current(5),  driver_board_present_current(6),
+                driver_board_present_current(7),  driver_board_present_current(8),
+                driver_board_present_current(9),  driver_board_present_current(10),
+                driver_board_present_current(11), driver_board_present_current(12));
 
         }else if(Back){
             time_mSt=millis(); tim=0;
@@ -619,7 +661,6 @@ static void gait_task(void *arg){
             float crouchZfront = 40;
             float pushZ        = 105;
             float tuckZ        = 45;
-            float landZ        = height;
 
             // ----------------------------------------------------------------
             // Phase 1: CONTROLLED CROUCH
@@ -656,12 +697,11 @@ static void gait_task(void *arg){
             // Read torque (load %) and current (mA) on the rear knee servos
             // right at the moment of the push, to see how hard they're working.
             {
-                int fb9  = FeedBack(9);
-                int err9 = getLastError();
-                ESP_LOGI(TAG, "JumpFwd push RR knee: fb=%d err=%d load=%d cur=%dmA", fb9, err9, ReadLoad(-1), ReadCurrent(-1));
-                int fb12 = FeedBack(12);
-                int err12 = getLastError();
-                ESP_LOGI(TAG, "JumpFwd push RL knee: fb=%d err=%d load=%d cur=%dmA", fb12, err12, ReadLoad(-1), ReadCurrent(-1));
+                // feedback now comes back on each SPI transaction (position + current)
+                ESP_LOGI(TAG, "JumpFwd push RR knee(9):  pos=%u cur=%dmA",
+                         driver_board_present_position(9),  driver_board_present_current(9));
+                ESP_LOGI(TAG, "JumpFwd push RL knee(12): pos=%u cur=%dmA",
+                         driver_board_present_position(12), driver_board_present_current(12));
             }
 
             // Airborne window
@@ -734,6 +774,15 @@ static void gait_task(void *arg){
             servo_speed_all(0);
             TestSpeed = 0;   // auto-clears after one run
 
+        }else if(manual8){
+            // Hold a neutral stand, but drive servo 8 to the manually entered
+            // position instead of the value the IK just computed.
+            servo_speed_all(0);
+            fRIK(0,0,height); rRIK(0,0,height); fLIK(0,0,height); rLIK(0,0,height);
+            goal[8] = manual8_pos;   // override just servo 8
+            servo_flush();
+            vTaskDelay(1);
+
         }else{
             fRIK(0,0,height); rRIK(0,0,height); fLIK(0,0,height); rLIK(0,0,height);
             servo_flush();
@@ -749,11 +798,8 @@ void app_main(void){
     }
     nvs_open("parameter", NVS_READWRITE, &nvs);
 
-    gpio_set_direction(8, GPIO_MODE_OUTPUT);
-    gpio_set_level(8, 1);
-    vTaskDelay(pdMS_TO_TICKS(1000));
-
-    ftServo_InitWithType(SERVO_SCSCL, SERVO_TX_PIN, SERVO_RX_PIN, -1, SERVO_BAUD_RATE);
+    driver_board_init();                 // SPI bus + 4 AT32 driver boards + servo power ON
+    vTaskDelay(pdMS_TO_TICKS(1000));     // let servo power rails settle
 
     int32_t v;
     if(nvs_get_i32(nvs,"period",&v)==ESP_OK) period=v;

@@ -1,4 +1,3 @@
 dependencies:
   idf: ">=6.0"
-  dong-12345/ftservo: "^1.1.0"
   espressif/mqtt: "^1.0.0"
