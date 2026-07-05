@@ -52,6 +52,74 @@ void driver_board_sync_write(const uint16_t pos[12], const uint16_t cur_mA[12]);
 int16_t  driver_board_present_current(int ch);   /* motor current, mA (signed) */
 uint16_t driver_board_present_position(int ch);  /* SCS scale 0..1023          */
 
+/* ---- AT32 sms_config parameter access over SPI (web CLI) ----------------
+ * Parameter ids match the AT32 UART CLI table order.
+ * NOTE: do not run these concurrently with driver_board_sync_write() —
+ * pause the gait loop first (CLI mode).                                    */
+enum {
+    DB_PARAM_REVERSE_POSITION_SENSOR = 0,
+    DB_PARAM_MIN_POSITION_ADC,      /* 1 */
+    DB_PARAM_MAX_POSITION_ADC,      /* 2 */
+    DB_PARAM_RANGE_POSITION_DEG,    /* 3 */
+    DB_PARAM_REVERSE_MOTOR,         /* 4 */
+    DB_PARAM_KP_POSITION,           /* 5 */
+    DB_PARAM_KD_POSITION,           /* 6 */
+    DB_PARAM_KP_CURRENT,            /* 7 */
+    DB_PARAM_KFF_CURRENT,           /* 8 */
+    DB_PARAM_MAX_PWM_DUTY_CYCLE,    /* 9 */
+    DB_PARAM_COUNT
+};
+
+/* Parameter name for id, or NULL if out of range. */
+const char *driver_board_param_name(int param_id);
+/* Name -> id, or -1 if unknown. */
+int driver_board_param_id(const char *name);
+
+/* servo = 1..12 (global id). Return true on success. */
+bool driver_board_set_param(int servo, int param_id, float value);
+bool driver_board_get_param(int servo, int param_id, float *out);
+
+/* board = 0..3, or -1 for all boards. */
+bool driver_board_save_config(int board);      /* commit sms_config to flash */
+bool driver_board_factory_restore(int board);  /* factory defaults (RAM only) */
+
+/* ---- direct single-servo control (web CLI pos/tor/stop) -----------------
+ * Sends one servo command frame to the servo's board; the OTHER two servos
+ * on that board keep their last commanded values (shadow of the last
+ * sync_write / direct write). Angle is the RAW AT32 angle in degrees,
+ * 0..270 (135 = centre) - same units as the AT32 UART CLI 'pos' command. */
+#define DB_MODE_IDLE     0
+#define DB_MODE_POSITION 1
+#define DB_MODE_TORQUE   2
+
+bool driver_board_direct(int servo /*1..12*/, uint16_t mode,
+                         float pos_deg, int16_t current_mA);
+
+/* Refresh feedback for this servo's board by resending the last commanded
+ * frame (setpoints unchanged). Use driver_board_present_*() afterwards.
+ * Used by the web CLI 'trace' live view.                                  */
+bool driver_board_poll(int servo /*1..12*/);
+
+/* ---- live control-loop values (web trace, needs new AT32 firmware) ------
+ * Same set the AT32 uart_trace() prints:                                   */
+enum {
+    DB_LIVE_POS_ADC = 0,        /* position sensor, raw ADC     */
+    DB_LIVE_CUR_ADC,            /* current sense, raw ADC       */
+    DB_LIVE_SETPOINT_POS_DEG,   /* commanded position, deg      */
+    DB_LIVE_PRESENT_POS_DEG,    /* measured position, deg       */
+    DB_LIVE_ERROR_POS_DEG,      /* position error, deg          */
+    DB_LIVE_MAX_CURRENT_MA,     /* current cap (position mode)  */
+    DB_LIVE_SETPOINT_CUR_MA,    /* current setpoint (torque)    */
+    DB_LIVE_PRESENT_CUR_MA,     /* measured motor current, mA   */
+    DB_LIVE_ERROR_CUR_MA,       /* current error, mA            */
+    DB_LIVE_PWM_DUTY,           /* PWM duty cycle 0..1          */
+    DB_LIVE_MODE,               /* 0 idle 1 position 2 torque   */
+    DB_LIVE_LOOP_COUNTER,       /* control loop tick counter    */
+    DB_LIVE_COUNT
+};
+
+bool driver_board_get_live(int servo /*1..12*/, int live_id, float *out);
+
 #ifdef __cplusplus
 }
 #endif

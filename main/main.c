@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include <stdarg.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_system.h"
@@ -54,6 +55,12 @@ static int Advance=0, Back=0, Left=0, Right=0, TurnL=0, TurnR=0;
 static int Twerk=0, Jump=0, JumpFwd=0, TestSpeed=0, Mate=0, Stanford=0;
 static int sg_started=0;   // Stanford gait state initialised for this activation
 
+// CLI mode: pauses the gait loop so the HTTP task has exclusive SPI access
+// to the AT32 driver boards for parameter get/set (kp_position, kd_position,
+// kp_current, kff_current, ...). Servos hold their last position.
+static int  CliMode = 0;
+static char cli_out[6144];   // last CLI command output, shown in the web UI
+
 static int period=80, height=70, upHeight=10, stride=10, tilt=10;
 
 static uint16_t goal[13];
@@ -101,6 +108,258 @@ static void reset_all_modes(void){
 static void toggle_motion(int *flag){
     if(*flag){ *flag=0; reset_all_modes(); }
     else     { reset_all_modes(); *flag=1; }
+}
+
+/* ---------------- web CLI for the AT32 driver boards -------------------
+ * Same command style as the AT32 UART CLI, but with GLOBAL servo ids 1..12
+ * (board = (id-1)/3 is addressed automatically over SPI):
+ *   7 set kp_position 30     7 get kp_position     7 dump
+ *   dump | save [id] | restore [id] | help                              */
+static void urldecode(char *s){
+    char *o = s;
+    while(*s){
+        if(*s=='+'){ *o++=' '; s++; }
+        else if(*s=='%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])){
+            char h[3]={s[1],s[2],0};
+            *o++ = (char)strtol(h,NULL,16); s+=3;
+        }else *o++ = *s++;
+    }
+    *o = 0;
+}
+
+static void cli_printf(const char *fmt, ...){
+    size_t len = strlen(cli_out);
+    if(len >= sizeof(cli_out)-2) return;
+    va_list ap; va_start(ap, fmt);
+    vsnprintf(cli_out+len, sizeof(cli_out)-len, fmt, ap);
+    va_end(ap);
+}
+
+static void cli_dump_servo(int id){
+    for(int p=0; p<DB_PARAM_COUNT; p++){
+        float v;
+        if(driver_board_get_param(id, p, &v))
+            cli_printf("%2d set %-24s = %g\n", id, driver_board_param_name(p), v);
+        else
+            cli_printf("%2d     %-24s   <no reply>\n", id, driver_board_param_name(p));
+    }
+}
+
+static void cli_list_params(void){
+    cli_printf("params:\n");
+    for(int p=0; p<DB_PARAM_COUNT; p++)
+        cli_printf("  %s\n", driver_board_param_name(p));
+}
+
+static void cli_exec(char *cmd){
+    cli_out[0]=0;
+    // echo (sanitised for the <pre> block)
+    for(char *p=cmd; *p; p++) if(*p=='<'||*p=='>') *p='.';
+    cli_printf("> %s\n", cmd);
+    for(char *p=cmd; *p; p++) if(*p=='=') *p=' ';   // allow "set kp = 30"
+
+    char *sp=NULL;
+    char *t0 = strtok_r(cmd, " \t", &sp);
+    if(!t0){ cli_printf("empty command (try help)\n"); return; }
+
+    if(!strcmp(t0,"help")){
+        cli_printf("commands:\n"
+                   "  <id 1-12> get <param>\n"
+                   "  <id 1-12> set <param> <value>\n"
+                   "  <id 1-12> dump\n"
+                   "  <id 1-12> pos <deg 0-270> [current_mA]   (default 130mA)\n"
+                   "  <id 1-12> tor <current_mA>   torque mode, +/- direction\n"
+                   "  <id 1-12> stop               idle, motor off\n"
+                   "  <id 1-12> fb                 present position + current\n"
+                   "  dump              all 12 servos\n"
+                   "  trace <id>        live position/current view (trace off = stop)\n"
+                   "  save [id]         save board config to flash\n"
+                   "  restore [id]      factory defaults (RAM, then save)\n"
+                   "note: pos uses RAW AT32 angle, 135 = centre, no direction flip\n");
+        cli_list_params();
+
+    }else if(!strcmp(t0,"dump")){
+        char *t1 = strtok_r(NULL," \t",&sp);
+        if(t1){
+            int id=atoi(t1);
+            if(id>=1 && id<=12) cli_dump_servo(id);
+            else cli_printf("bad servo id '%s'\n", t1);
+        }else{
+            for(int id=1; id<=12; id++){ cli_dump_servo(id); cli_printf("\n"); }
+        }
+
+    }else if(!strcmp(t0,"save")){
+        char *t1 = strtok_r(NULL," \t",&sp);
+        int board = -1;
+        if(t1){ int id=atoi(t1); if(id>=1&&id<=12) board=(id-1)/3; }
+        cli_printf(driver_board_save_config(board)
+            ? "OK. saved to flash (%s)\n" : "save FAILED (%s)\n",
+            board<0 ? "all boards" : "one board");
+
+    }else if(!strcmp(t0,"trace")){
+        // Live view: the browser polls /tracepoll and updates the console.
+        char *t1 = strtok_r(NULL," \t",&sp);
+        if(t1 && !strcmp(t1,"off")){
+            cli_printf("TRACE OFF\n");
+        }else{
+            int id = t1 ? atoi(t1) : 0;
+            if(id>=1 && id<=12)
+                cli_printf("TRACE ON servo %d - live view in the blue box.\n"
+                           "Other commands (pos/tor/set/...) keep working while\n"
+                           "it runs. Stop with 'trace off'.\n", id);
+            else cli_printf("usage: trace <id 1-12> | trace off\n");
+        }
+
+    }else if(!strcmp(t0,"restore") || !strcmp(t0,"factory_restore")){
+        char *t1 = strtok_r(NULL," \t",&sp);
+        int board = -1;
+        if(t1){ int id=atoi(t1); if(id>=1&&id<=12) board=(id-1)/3; }
+        cli_printf(driver_board_factory_restore(board)
+            ? "OK. factory defaults loaded (RAM). Run 'save' to keep them.\n"
+            : "restore FAILED\n");
+
+    }else{
+        int id = atoi(t0);
+        if(id<1 || id>12){ cli_printf("unknown command '%s' (try help)\n", t0); return; }
+        char *t1 = strtok_r(NULL," \t",&sp);
+        if(!t1){ cli_printf("missing operator: get/set/dump/pos/tor/stop/fb (try help)\n"); return; }
+
+        if(!strcmp(t1,"dump")){
+            cli_dump_servo(id);
+
+        }else if(!strcmp(t1,"pos")){
+            char *t2 = strtok_r(NULL," \t",&sp);
+            if(!t2){ cli_printf("usage: %d pos <deg 0-270> [current_mA]\n", id); return; }
+            float deg = strtof(t2,NULL);
+            char *t3 = strtok_r(NULL," \t",&sp);
+            int cur = t3 ? atoi(t3) : 130;   /* same default as AT32 CLI */
+            if(driver_board_direct(id, DB_MODE_POSITION, deg, (int16_t)cur))
+                cli_printf("OK. %d pos %.1f deg, max %d mA\n", id, deg, cur);
+            else cli_printf("pos FAILED\n");
+
+        }else if(!strcmp(t1,"tor")){
+            char *t2 = strtok_r(NULL," \t",&sp);
+            if(!t2){ cli_printf("usage: %d tor <current_mA>\n", id); return; }
+            int cur = atoi(t2);
+            if(driver_board_direct(id, DB_MODE_TORQUE, 135, (int16_t)cur))
+                cli_printf("OK. %d torque %d mA\n", id, cur);
+            else cli_printf("tor FAILED\n");
+
+        }else if(!strcmp(t1,"stop")){
+            if(driver_board_direct(id, DB_MODE_IDLE, 135, 0))
+                cli_printf("OK. %d idle (motor off)\n", id);
+            else cli_printf("stop FAILED\n");
+
+        }else if(!strcmp(t1,"fb")){
+            cli_printf("%2d present: pos=%u (SCS 0-1023), cur=%d mA\n",
+                       id, driver_board_present_position(id),
+                       driver_board_present_current(id));
+
+        }else if(!strcmp(t1,"get") || !strcmp(t1,"set")){
+            char *t2 = strtok_r(NULL," \t",&sp);
+            int p = t2 ? driver_board_param_id(t2) : -1;
+            if(p<0){ cli_printf("unknown parameter '%s'\n", t2?t2:""); cli_list_params(); return; }
+
+            if(!strcmp(t1,"get")){
+                float v;
+                if(driver_board_get_param(id,p,&v))
+                    cli_printf("%2d set %s = %g\n", id, driver_board_param_name(p), v);
+                else cli_printf("get FAILED (no reply from board)\n");
+            }else{
+                char *t3 = strtok_r(NULL," \t",&sp);
+                if(!t3){ cli_printf("missing value\n"); return; }
+                float v = strtof(t3,NULL), rb=0;
+                if(driver_board_set_param(id,p,v) && driver_board_get_param(id,p,&rb))
+                    cli_printf("%2d set %s = %g  (readback OK)\n"
+                               "RAM only - run 'save %d' to keep after power off\n",
+                               id, driver_board_param_name(p), rb, id);
+                else cli_printf("set FAILED (no reply from board)\n");
+            }
+        }else cli_printf("unknown operator '%s' (get/set/dump/pos/tor/stop/fb)\n", t1);
+    }
+}
+
+/* ---------------- serial CLI (idf.py monitor), no HTTP ------------------
+ * Same commands as the web CLI, plus:
+ *   cli on / cli off   toggle CLI mode (pause/resume the gait) from serial
+ *   trace <id>         streams live values at 10 Hz until any key is pressed
+ * Runs as its own task; stdin is polled non-blocking (works on the UART
+ * console and on USB-Serial-JTAG).                                        */
+static void serial_trace_stream(int id){
+    if(!CliMode){ printf("run 'cli on' first (gait would fight the SPI bus)\n"); return; }
+    printf("streaming servo %d at 10 Hz - press any key to stop\n", id);
+    static const char *mn[] = {"IDLE","POS ","TOR ","IK  "};
+    for(;;){
+        float lv[DB_LIVE_COUNT];
+        bool ok = true;
+        for(int i=0; i<DB_LIVE_COUNT && ok; i++)
+            ok = driver_board_get_live(id, i, &lv[i]);
+        if(ok){
+            int m = (int)lv[DB_LIVE_MODE];
+            printf("pos s/n/e %6.1f/%6.1f/%5.1f deg | cur c/s/n/e %4.0f/%4.0f/%4.0f/%4.0f mA"
+                   " | duty %5.1f%% | adc %4.0f/%4.0f | %s | loop %lu\n",
+                   lv[DB_LIVE_SETPOINT_POS_DEG], lv[DB_LIVE_PRESENT_POS_DEG],
+                   lv[DB_LIVE_ERROR_POS_DEG],
+                   lv[DB_LIVE_MAX_CURRENT_MA], lv[DB_LIVE_SETPOINT_CUR_MA],
+                   lv[DB_LIVE_PRESENT_CUR_MA], lv[DB_LIVE_ERROR_CUR_MA],
+                   lv[DB_LIVE_PWM_DUTY]*100.0f,
+                   lv[DB_LIVE_POS_ADC], lv[DB_LIVE_CUR_ADC],
+                   (m>=0&&m<4)?mn[m]:"?", (unsigned long)lv[DB_LIVE_LOOP_COUNTER]);
+        }else if(driver_board_poll(id)){
+            printf("pos %4u SCS  cur %5d mA  (basic - old AT32 fw)\n",
+                   driver_board_present_position(id), driver_board_present_current(id));
+        }else printf("SPI poll failed\n");
+
+        if(getchar() != EOF) break;          /* any key stops the stream */
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    printf("trace stopped\n");
+}
+
+static void serial_handle_line(char *line){
+    if(!strcmp(line,"cli on")){
+        if(!CliMode){ reset_all_modes(); CliMode=1; vTaskDelay(pdMS_TO_TICKS(50)); }
+        printf("CLI mode ON (gait paused, servos hold position)\n");
+        return;
+    }
+    if(!strcmp(line,"cli off")){
+        CliMode=0;
+        printf("CLI mode OFF (gait resumed)\n");
+        return;
+    }
+    int tid;
+    if(sscanf(line,"trace %d",&tid)==1){
+        if(tid>=1 && tid<=12) serial_trace_stream(tid);
+        else printf("bad servo id\n");
+        return;
+    }
+    if(!CliMode && strcmp(line,"help")!=0)
+        printf("note: CLI mode is OFF - run 'cli on' first, or SPI replies may garble\n");
+    cli_exec(line);
+    fputs(cli_out, stdout);
+}
+
+static void console_task(void *arg){
+    (void)arg;
+    setvbuf(stdin, NULL, _IONBF, 0);
+    char line[128];
+    int pos = 0;
+    printf("\nPupper serial CLI ready. 'cli on' to pause gait, 'help' for commands.\n> ");
+    fflush(stdout);
+    for(;;){
+        int c = getchar();
+        if(c == EOF){ vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        if(c=='\r' || c=='\n'){
+            printf("\n");
+            if(pos > 0){ line[pos]=0; pos=0; serial_handle_line(line); }
+            printf("> "); fflush(stdout);
+        }else if(c==8 || c==127){                 /* backspace */
+            if(pos>0){ pos--; printf("\b \b"); fflush(stdout); }
+        }else if(pos < (int)sizeof(line)-1 && c>=32 && c<127){
+            line[pos++] = (char)c;
+            putchar(c); fflush(stdout);           /* echo */
+        }
+    }
 }
 
 // Command name -> flag table, shared between the web UI and MQTT.
@@ -174,11 +433,12 @@ static void rLIK(float x,float th0,float z){
     servo_write(12,-(th2*180.0f/PI)+ offset[12]);
 }
 
+#define ROOT_BUF_SZ 24000   /* room for the CLI dump output in the page */
 static esp_err_t send_root(httpd_req_t *req){
-    char *b = malloc(12000);
+    char *b = malloc(ROOT_BUF_SZ);
     if(!b) return ESP_ERR_NO_MEM;
     int n=0;
-    #define A(...) n += snprintf(b+n, 12000-n, __VA_ARGS__)
+    #define A(...) n += snprintf(b+n, ROOT_BUF_SZ-n, __VA_ARGS__)
     #define ON(x) ((x)?"on":"off")
 
     A("<!DOCTYPE html><html lang=\"ja\"><head><meta charset=\"utf-8\">"
@@ -225,6 +485,29 @@ static esp_err_t send_root(httpd_req_t *req){
     A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
       "style=\"background:#16a085;\"><a href=\"/stanford\" style=\"color:white;\">&#128021; Stanford Walk</a>"
       "</button></div>", ON(Stanford));
+    A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
+      "style=\"background:#34495e;\"><a href=\"/climode\" style=\"color:white;\">&#128187; CLI Mode</a>"
+      "</button></div>", ON(CliMode));
+    if(CliMode){
+        // AJAX CLI: command runs via fetch(), only the output box updates -
+        // the page never reloads or jumps to the top.
+        A("<div style=\"margin:8px auto;max-width:340px;\">"
+          "<form id=\"clif\" onsubmit=\"return runCli(this)\">"
+          "<input name=\"c\" id=\"clin\" style=\"width:225px;height:34px;\" "
+          "placeholder=\"7 set kp_position 30\" autofocus autocomplete=\"off\">"
+          "<button type=\"submit\" style=\"width:64px;height:40px;\">Run</button></form>"
+          "<div style=\"font-size:0.72rem;color:#666;text-align:left;\">"
+          "e.g. <code>7 pos 135 200</code> &middot; <code>7 tor 150</code> &middot; "
+          "<code>7 stop</code> &middot; <code>trace 7</code> &middot; "
+          "<code>7 get kp_position</code> &middot; <code>dump</code> &middot; "
+          "<code>save</code> &middot; <code>help</code></div>"
+          "<pre id=\"trout\" style=\"display:none;text-align:left;background:#001a33;"
+          "color:#6cf;padding:8px;font-size:0.72rem;white-space:pre-wrap;"
+          "word-wrap:break-word;\"></pre>"
+          "<pre id=\"cliout\" style=\"text-align:left;background:#111;color:#0f0;padding:8px;"
+          "font-size:0.72rem;white-space:pre-wrap;word-wrap:break-word;\">%s</pre>"
+          "</div>", cli_out);
+    }
     A("<div style=\"margin:8px auto;\"><form action=\"/leg8\" method=\"get\" "
       "style=\"display:inline;\">Leg 8 pos (0-1023): "
       "<input type=\"number\" name=\"v\" value=\"%d\" min=\"0\" max=\"1023\" "
@@ -260,7 +543,54 @@ static esp_err_t send_root(httpd_req_t *req){
     }
     A("<button type=\"button\" style=\"background:#ff6b6b;color:white;width:200px;\">"
       "<a href=\"/calReset\" style=\"color:white;\">Reset All Offsets to 0</a></button><br>"
-      "</div></body></html>");
+      "</div>"
+      // AJAX navigation: every button / +/- link / form is fetched in the
+      // background and only the page body is swapped in place, so the page
+      // NEVER reloads and never jumps - you stay exactly where you are.
+      // (scroll save/restore kept as fallback for a manual F5)
+      "<script>"
+      "window.addEventListener('load',function(){"
+      "var y=sessionStorage.getItem('sy');if(y)window.scrollTo(0,parseInt(y));});"
+      "window.addEventListener('beforeunload',function(){"
+      "sessionStorage.setItem('sy',window.scrollY);});"
+      "function swapBody(t){var d=document.implementation.createHTMLDocument('');"
+      "d.documentElement.innerHTML=t;document.body.innerHTML=d.body.innerHTML;}"
+      // web CLI (always defined, so it works after in-place body swaps too).
+      // Trace runs in its OWN box (trout), so pos/tor/set/... commands keep
+      // working below while the trace keeps updating.
+      "var trI=null;"
+      "function trStop(){if(trI){clearInterval(trI);trI=null;}"
+      "var o=document.getElementById('trout');"
+      "if(o){o.style.display='none';o.textContent='';}}"
+      "function trStart(id){if(trI)clearInterval(trI);trI=setInterval(function(){"
+      "var o=document.getElementById('trout');"
+      "if(!o){clearInterval(trI);trI=null;return;}"
+      "fetch('/tracepoll?id='+id).then(function(r){return r.text();})"
+      ".then(function(t){o.style.display='block';o.textContent=t;"
+      "if(t.indexOf('stopped')>=0)trStop();});},400);}"
+      "function runCli(f){var v=f.c.value;if(!v)return false;"
+      "var mOn=v.match(/^\\s*trace\\s+(\\d+)\\s*$/i);"
+      "var mOff=v.match(/^\\s*trace\\s+off\\s*$/i);"
+      "document.getElementById('cliout').textContent='...';"
+      "fetch('/clix?c='+encodeURIComponent(v)).then(function(r){return r.text();})"
+      ".then(function(t){document.getElementById('cliout').textContent=t;"
+      "if(mOn)trStart(mOn[1]);else if(mOff)trStop();"
+      "f.c.value='';f.c.focus();})"
+      ".catch(function(e){document.getElementById('cliout').textContent='request failed: '+e;});"
+      "return false;}"
+      "document.addEventListener('click',function(e){"
+      "var a=e.target&&e.target.closest?e.target.closest('a'):null;if(!a)return;"
+      "var h=a.getAttribute('href');if(!h||h.charAt(0)!='/')return;"
+      "e.preventDefault();"
+      "fetch(h).then(function(r){return r.text();}).then(swapBody);});"
+      "document.addEventListener('submit',function(e){"
+      "var f=e.target;if(f.id=='clif')return;"   // CLI form has its own AJAX
+      "e.preventDefault();"
+      "var p=new URLSearchParams(new FormData(f)).toString();"
+      "fetch(f.getAttribute('action')+'?'+p).then(function(r){return r.text();})"
+      ".then(swapBody);});"
+      "</script>"
+      "</body></html>");
 
     #undef A
     #undef ON
@@ -331,6 +661,98 @@ static esp_err_t h_leg8(httpd_req_t*r){
     return send_root(r);
 }
 
+// Toggle CLI mode: pauses the gait task (exclusive SPI access), servos
+// hold their last commanded position via the AT32 control loops.
+static esp_err_t h_climode(httpd_req_t*r){
+    CliMode = !CliMode;
+    if(CliMode){
+        reset_all_modes();
+        snprintf(cli_out, sizeof cli_out,
+                 "CLI mode ON. Gait paused, servos hold position.\n"
+                 "Type 'help' for commands.\n");
+        vTaskDelay(pdMS_TO_TICKS(50));   // let the gait task park
+    }else cli_out[0]=0;
+    return send_root(r);
+}
+
+static esp_err_t h_clicmd(httpd_req_t*r){
+    if(!CliMode){
+        snprintf(cli_out, sizeof cli_out, "Enable CLI mode first.\n");
+        return send_root(r);
+    }
+    char q[300], c[256];
+    if(httpd_req_get_url_query_str(r,q,sizeof q)==ESP_OK &&
+       httpd_query_key_value(q,"c",c,sizeof c)==ESP_OK){
+        urldecode(c);
+        cli_exec(c);
+    }
+    return send_root(r);
+}
+
+// AJAX variant: runs the command and returns ONLY the output as text/plain,
+// so the browser updates the console box without reloading the page.
+static esp_err_t h_clix(httpd_req_t*r){
+    char q[300], c[256];
+    if(!CliMode){
+        httpd_resp_set_type(r, "text/plain");
+        return httpd_resp_sendstr(r, "Enable CLI mode first.\n");
+    }
+    if(httpd_req_get_url_query_str(r,q,sizeof q)==ESP_OK &&
+       httpd_query_key_value(q,"c",c,sizeof c)==ESP_OK){
+        urldecode(c);
+        cli_exec(c);
+    }
+    httpd_resp_set_type(r, "text/plain");
+    return httpd_resp_sendstr(r, cli_out);
+}
+
+// Live trace poll: read ALL control-loop values of one servo over SPI
+// (same set the AT32 uart_trace prints) and return them as text.
+static esp_err_t h_tracepoll(httpd_req_t*r){
+    httpd_resp_set_type(r, "text/plain");
+    if(!CliMode) return httpd_resp_sendstr(r, "CLI mode off - trace stopped.\n");
+
+    char q[64], v[8];
+    int id = 0;
+    if(httpd_req_get_url_query_str(r,q,sizeof q)==ESP_OK &&
+       httpd_query_key_value(q,"id",v,sizeof v)==ESP_OK) id = atoi(v);
+    if(id<1 || id>12) return httpd_resp_sendstr(r, "trace: bad servo id\n");
+
+    float lv[DB_LIVE_COUNT];
+    bool live_ok = true;
+    for(int i=0; i<DB_LIVE_COUNT && live_ok; i++)
+        live_ok = driver_board_get_live(id, i, &lv[i]);
+
+    char b[560];
+    if(live_ok){
+        static const char *mn[] = {"IDLE","POSITION","TORQUE","IK"};
+        int m = (int)lv[DB_LIVE_MODE];
+        snprintf(b, sizeof b,
+            "TRACE servo %d (live)   mode=%s   loop=%lu\n"
+            "position:  set=%7.1f deg  now=%7.1f deg  err=%6.1f deg\n"
+            "current:   cap=%5.0f mA  set=%5.0f mA  now=%5.0f mA  err=%5.0f mA\n"
+            "pwm duty:  %5.1f %%\n"
+            "raw ADC:   pos=%5.0f   cur=%5.0f\n",
+            id, (m>=0&&m<4)?mn[m]:"?", (unsigned long)lv[DB_LIVE_LOOP_COUNTER],
+            lv[DB_LIVE_SETPOINT_POS_DEG], lv[DB_LIVE_PRESENT_POS_DEG],
+            lv[DB_LIVE_ERROR_POS_DEG],
+            lv[DB_LIVE_MAX_CURRENT_MA], lv[DB_LIVE_SETPOINT_CUR_MA],
+            lv[DB_LIVE_PRESENT_CUR_MA], lv[DB_LIVE_ERROR_CUR_MA],
+            lv[DB_LIVE_PWM_DUTY]*100.0f,
+            lv[DB_LIVE_POS_ADC], lv[DB_LIVE_CUR_ADC]);
+    }else if(driver_board_poll(id)){
+        // old AT32 firmware without GET_LIVE: basic feedback only
+        uint16_t p = driver_board_present_position(id);
+        snprintf(b, sizeof b,
+            "TRACE servo %d (basic - flash new AT32 fw for full trace)\n"
+            "pos = %4u SCS  %6.1f deg raw\ncur = %4d mA\n",
+            id, p, (float)p*270.0f/1024.0f, driver_board_present_current(id));
+    }else{
+        snprintf(b, sizeof b, "trace: SPI poll failed\n");
+    }
+    return httpd_resp_sendstr(r, b);
+}
+
 static void reg(httpd_handle_t s,const char*uri,esp_err_t(*h)(httpd_req_t*)){
     httpd_uri_t u={.uri=uri,.method=HTTP_GET,.handler=h};
     httpd_register_uri_handler(s,&u);
@@ -353,6 +775,10 @@ static void start_webserver(void){
     reg(s,"/twerk",h_twerk); reg(s,"/jump",h_jump); reg(s,"/jumpfwd",h_jumpfwd); reg(s,"/testspeed",h_testspeed);
     reg(s,"/mate",h_mate);
     reg(s,"/stanford",h_stanford);
+    reg(s,"/climode",h_climode);
+    reg(s,"/clicmd",h_clicmd);
+    reg(s,"/clix",h_clix);
+    reg(s,"/tracepoll",h_tracepoll);
     reg(s,"/periodM",h_periodM); reg(s,"/periodP",h_periodP);
     reg(s,"/heightM",h_heightM); reg(s,"/heightP",h_heightP);
     reg(s,"/upHeightM",h_upM);   reg(s,"/upHeightP",h_upP);
@@ -450,7 +876,12 @@ static void gait_task(void *arg){
     servo_speed_all(0);
 
     for(;;){
-        if(Ini){
+        if(CliMode){
+            // Web CLI owns the SPI bus; do not touch the driver boards.
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+
+        }else if(Ini){
             servo_speed_all(0);
             for(int i=1; i<=12; i++) servo_write(i, offset[i]);
             servo_flush();
@@ -849,4 +1280,5 @@ void app_main(void){
     start_webserver();
 
     xTaskCreatePinnedToCore(gait_task, "gait", 8192, NULL, 22, NULL, 1);
+    xTaskCreatePinnedToCore(console_task, "console", 4096, NULL, 5, NULL, 0);
 }

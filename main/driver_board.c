@@ -12,6 +12,7 @@
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_rom_sys.h"   /* esp_rom_delay_us */
 
 #define TAG "DRVBOARD"
 
@@ -44,6 +45,13 @@ static spi_device_handle_t dev_left_front, dev_right_front, dev_left_rear, dev_r
 /* cached feedback, index 0 == servo ID 1 */
 static uint16_t fb_position[12];
 static int16_t  fb_current[12];
+
+/* shadow of the last commanded state per servo (deci-degrees), so a direct
+ * single-servo write can resend the board frame without disturbing the
+ * other two servos on the same board */
+static uint16_t sh_mode[12]  = { [0 ... 11] = MODE_POSITION };
+static uint16_t sh_posdd[12] = { [0 ... 11] = 1350 };   /* 135.0 deg centre */
+static int16_t  sh_cur[12]   = { 0 };
 
 /* board index (0..3) -> SPI device. Matches reference spi_read_write_bytes(). */
 static esp_err_t spi_xfer(uint8_t board, uint8_t size, uint8_t *tx, uint8_t *rx)
@@ -128,6 +136,9 @@ void driver_board_sync_write(const uint16_t pos[12], const uint16_t cur_mA[12])
             sub[j]->torque   = (int16_t)cur_mA[idx];   /* MODE_POSITION => max current (mA) */
             sub[j]->kp = 0;
             sub[j]->kd = 0;
+            sh_mode[idx]  = MODE_POSITION;             /* keep shadow in sync */
+            sh_posdd[idx] = sub[j]->position;
+            sh_cur[idx]   = sub[j]->torque;
         }
         frame.check_sum = 0;
 
@@ -139,6 +150,161 @@ void driver_board_sync_write(const uint16_t pos[12], const uint16_t cur_mA[12])
             }
         }
     }
+}
+
+/* ---- AT32 sms_config parameter access (config frames, start 0xC0DE) ---- */
+#define START_CONFIG    0xC0DE
+#define CFG_OP_NOP      0
+#define CFG_OP_SET      1
+#define CFG_OP_GET      2
+#define CFG_OP_SAVE     3
+#define CFG_OP_RESTORE  4
+#define CFG_OP_GET_LIVE 5
+
+#pragma pack(push,1)
+typedef struct {
+    uint16_t start, op, servo_index, param_id;
+    float    value;
+    uint8_t  padding[24];   /* pad to sizeof(host_SMS_t) = 36 bytes */
+} cfg_frame_t;
+#pragma pack(pop)
+_Static_assert(sizeof(cfg_frame_t) == sizeof(host_SMS_t), "cfg frame size");
+
+static const char *param_names[DB_PARAM_COUNT] = {
+    "reverse_position_sensor", "min_position_adc", "max_position_adc",
+    "range_position_deg", "reverse_motor", "kp_position", "kd_position",
+    "kp_current", "kff_current", "max_pwm_duty_cycle",
+};
+
+const char *driver_board_param_name(int param_id)
+{
+    if (param_id < 0 || param_id >= DB_PARAM_COUNT) return NULL;
+    return param_names[param_id];
+}
+
+int driver_board_param_id(const char *name)
+{
+    for (int i = 0; i < DB_PARAM_COUNT; i++)
+        if (strcmp(name, param_names[i]) == 0) return i;
+    return -1;
+}
+
+static bool cfg_xfer(uint8_t board, uint16_t op, uint16_t servo_index,
+                     uint16_t param_id, float value, SMS_host_t *rx_out)
+{
+    cfg_frame_t f;
+    SMS_host_t rx;
+    memset(&f, 0, sizeof f);
+    f.start = START_CONFIG;
+    f.op = op; f.servo_index = servo_index;
+    f.param_id = param_id; f.value = value;
+    if (spi_xfer(board, sizeof f, (uint8_t *)&f, (uint8_t *)&rx) != ESP_OK)
+        return false;
+    if (rx_out) *rx_out = rx;
+    return true;
+}
+
+/* The AT32 loads its reply into the frame clocked out on the NEXT
+ * transaction, so every request is a request/NOP transaction pair. */
+static bool cfg_request(uint8_t board, uint16_t op, uint16_t servo_index,
+                        uint16_t param_id, float value, float *out)
+{
+    SMS_host_t rx;
+    if (!cfg_xfer(board, op, servo_index, param_id, value, NULL)) return false;
+    esp_rom_delay_us(500);                       /* let the AT32 IRQ run   */
+    if (!cfg_xfer(board, CFG_OP_NOP, 0, 0, 0, &rx)) return false;
+    if (rx.status != START_CONFIG) return false; /* not a config response  */
+    if (rx.s1.position != param_id) return false;/* echo mismatch          */
+    if (out) memcpy(out, &rx.s1.res, sizeof(float));
+    return true;
+}
+
+bool driver_board_set_param(int servo, int param_id, float value)
+{
+    if (servo < 1 || servo > 12 || param_id < 0 || param_id >= DB_PARAM_COUNT)
+        return false;
+    return cfg_request((uint8_t)((servo - 1) / 3), CFG_OP_SET,
+                       (uint16_t)((servo - 1) % 3), (uint16_t)param_id,
+                       value, NULL);
+}
+
+bool driver_board_get_param(int servo, int param_id, float *out)
+{
+    if (servo < 1 || servo > 12 || param_id < 0 || param_id >= DB_PARAM_COUNT)
+        return false;
+    return cfg_request((uint8_t)((servo - 1) / 3), CFG_OP_GET,
+                       (uint16_t)((servo - 1) % 3), (uint16_t)param_id,
+                       0, out);
+}
+
+bool driver_board_get_live(int servo, int live_id, float *out)
+{
+    if (servo < 1 || servo > 12 || live_id < 0 || live_id >= DB_LIVE_COUNT)
+        return false;
+    return cfg_request((uint8_t)((servo - 1) / 3), CFG_OP_GET_LIVE,
+                       (uint16_t)((servo - 1) % 3), (uint16_t)live_id,
+                       0, out);
+}
+
+static bool cfg_board_op(int board, uint16_t op)
+{
+    if (board >= 0 && board <= 3)
+        return cfg_request((uint8_t)board, op, 0, 0, 0, NULL);
+    bool ok = true;                              /* board == -1: all boards */
+    for (int b = 0; b < 4; b++)
+        ok &= cfg_request((uint8_t)b, op, 0, 0, 0, NULL);
+    return ok;
+}
+
+bool driver_board_save_config(int board)    { return cfg_board_op(board, CFG_OP_SAVE); }
+bool driver_board_factory_restore(int board){ return cfg_board_op(board, CFG_OP_RESTORE); }
+
+/* Send one board's frame rebuilt from the shadow, refresh feedback cache. */
+static bool board_resend(int board)
+{
+    int b = board * 3;
+    host_SMS_t frame;
+    SMS_host_t rx;
+    frame.start = START_FIELD;
+    frame.mode  = MODE_FIELD;
+    servo_cmd_sub_t *sub[3] = { &frame.s1, &frame.s2, &frame.s3 };
+    for (int j = 0; j < 3; j++) {
+        sub[j]->mode     = sh_mode[b + j];
+        sub[j]->position = sh_posdd[b + j];
+        sub[j]->torque   = sh_cur[b + j];
+        sub[j]->kp = 0;
+        sub[j]->kd = 0;
+    }
+    frame.check_sum = 0;
+
+    if (spi_xfer((uint8_t)board, sizeof frame, (uint8_t *)&frame, (uint8_t *)&rx) != ESP_OK)
+        return false;
+
+    servo_fb_sub_t *fb[3] = { &rx.s1, &rx.s2, &rx.s3 };
+    for (int j = 0; j < 3; j++) {
+        fb_position[b + j] = (uint16_t)((uint32_t)fb[j]->position * 1024u / 2700u);
+        fb_current[b + j]  = fb[j]->torque;
+    }
+    return true;
+}
+
+bool driver_board_direct(int servo, uint16_t mode, float pos_deg, int16_t current_mA)
+{
+    if (servo < 1 || servo > 12) return false;
+    if (pos_deg < 0)   pos_deg = 0;
+    if (pos_deg > 270) pos_deg = 270;
+
+    int idx = servo - 1;
+    sh_mode[idx]  = mode;
+    sh_posdd[idx] = (uint16_t)(pos_deg * 10.0f);   /* RAW angle, no flip */
+    sh_cur[idx]   = current_mA;
+    return board_resend(idx / 3);
+}
+
+bool driver_board_poll(int servo)
+{
+    if (servo < 1 || servo > 12) return false;
+    return board_resend((servo - 1) / 3);
 }
 
 int16_t driver_board_present_current(int ch)
