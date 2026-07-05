@@ -17,6 +17,7 @@
 #include "lwip/ip4_addr.h"
 #include "driver/gpio.h"
 #include "driver_board.h"   // SPI controller-driver-board backend (replaces SCServo)
+#include "stanford_gait.h"  // Stanford Pupper trot gait port (forward walk)
 #include "mqtt_client.h"
 
 #define TAG "PUPPER"
@@ -50,7 +51,8 @@ static float L1 = 50, L2 = 56;
 
 static int Ini=0, Step=0, Roll=0, Pitch=0, Stretch=0;
 static int Advance=0, Back=0, Left=0, Right=0, TurnL=0, TurnR=0;
-static int Twerk=0, Jump=0, JumpFwd=0, TestSpeed=0, Mate=0;
+static int Twerk=0, Jump=0, JumpFwd=0, TestSpeed=0, Mate=0, Stanford=0;
+static int sg_started=0;   // Stanford gait state initialised for this activation
 
 static int period=80, height=70, upHeight=10, stride=10, tilt=10;
 
@@ -88,8 +90,9 @@ static inline uint32_t millis(void){ return (uint32_t)(esp_timer_get_time()/1000
 
 static void reset_all_modes(void){
     Ini=Step=Roll=Pitch=Stretch=0;
-    Advance=Back=Left=Right=TurnL=TurnR=Twerk=Jump=JumpFwd=TestSpeed=Mate=0; // <-- add TestSpeed here
+    Advance=Back=Left=Right=TurnL=TurnR=Twerk=Jump=JumpFwd=TestSpeed=Mate=Stanford=0; // <-- add TestSpeed here
     manual8=0;
+    sg_started=0;
 }
 
 // Toggle a motion flag the same way the web buttons do: pressing the
@@ -108,7 +111,7 @@ static const motion_cmd_t motion_cmds[] = {
     {"back",      &Back},     {"left",      &Left},     {"right",  &Right},
     {"turnl",     &TurnL},    {"turnr",     &TurnR},    {"twerk",  &Twerk},
     {"jump",      &Jump},     {"jumpfwd",   &JumpFwd},  {"testspeed",&TestSpeed},
-    {"mate",      &Mate},
+    {"mate",      &Mate},     {"stanford",  &Stanford},
 };
 #define MOTION_CMD_COUNT (sizeof(motion_cmds)/sizeof(motion_cmds[0]))
 
@@ -219,6 +222,9 @@ static esp_err_t send_root(httpd_req_t *req){
     A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
       "style=\"background:#c0392b;\"><a href=\"/mate\" style=\"color:white;\">&#10084; Mate</a>"
       "</button></div>", ON(Mate));
+    A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
+      "style=\"background:#16a085;\"><a href=\"/stanford\" style=\"color:white;\">&#128021; Stanford Walk</a>"
+      "</button></div>", ON(Stanford));
     A("<div style=\"margin:8px auto;\"><form action=\"/leg8\" method=\"get\" "
       "style=\"display:inline;\">Leg 8 pos (0-1023): "
       "<input type=\"number\" name=\"v\" value=\"%d\" min=\"0\" max=\"1023\" "
@@ -279,6 +285,7 @@ MOTION(h_jump,Jump)
 MOTION(h_jumpfwd,JumpFwd)
 MOTION(h_testspeed,TestSpeed)
 MOTION(h_mate,Mate)
+MOTION(h_stanford,Stanford)
 
 static esp_err_t h_root(httpd_req_t*r){ return send_root(r); }
 
@@ -345,6 +352,7 @@ static void start_webserver(void){
     reg(s,"/right",h_right); reg(s,"/turnL",h_turnL); reg(s,"/turnR",h_turnR);
     reg(s,"/twerk",h_twerk); reg(s,"/jump",h_jump); reg(s,"/jumpfwd",h_jumpfwd); reg(s,"/testspeed",h_testspeed);
     reg(s,"/mate",h_mate);
+    reg(s,"/stanford",h_stanford);
     reg(s,"/periodM",h_periodM); reg(s,"/periodP",h_periodP);
     reg(s,"/heightM",h_heightM); reg(s,"/heightP",h_heightP);
     reg(s,"/upHeightM",h_upM);   reg(s,"/upHeightP",h_upP);
@@ -773,6 +781,36 @@ static void gait_task(void *arg){
             ESP_LOGI(TAG, "--- Speed Test DONE ---");
             servo_speed_all(0);
             TestSpeed = 0;   // auto-clears after one run
+
+        }else if(Stanford){
+            // Stanford Pupper trot gait (forward only), ported from
+            // mangdangroboticsclub/StanfordQuadruped. Uses the NATIVE Mini
+            // Pupper parameters from the BSP Config.py (height 80 mm,
+            // clearance 30 mm, 15 ms tick) — independent of the web
+            // sliders, so height/period/stride/upHeight are untouched.
+            static int64_t sg_next_us = 0;
+
+            if(!sg_started){
+                stanford_gait_reset(SG_NATIVE_HEIGHT_MM);
+                sg_next_us = esp_timer_get_time();
+                servo_speed_all(0);
+                sg_started = 1;
+            }
+
+            sg_foot_t feet[4];
+            stanford_gait_step(SG_NATIVE_VX_MM_S, SG_NATIVE_HEIGHT_MM,
+                               SG_NATIVE_CLEARANCE_MM, feet);
+            fRIK(feet[0].x, 0, feet[0].z);   // Front Right
+            fLIK(feet[1].x, 0, feet[1].z);   // Front Left
+            rRIK(feet[2].x, 0, feet[2].z);   // Rear Right
+            rLIK(feet[3].x, 0, feet[3].z);   // Rear Left
+            servo_flush();
+
+            // Pace to the next 10 ms tick; resync if we fell far behind.
+            sg_next_us += (int64_t)(SG_DT * 1e6f);
+            int64_t now = esp_timer_get_time();
+            if(now > sg_next_us + 100000) sg_next_us = now;
+            while(esp_timer_get_time() < sg_next_us && Stanford) vTaskDelay(1);
 
         }else if(manual8){
             // Hold a neutral stand, but drive servo 8 to the manually entered
