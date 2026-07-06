@@ -39,6 +39,9 @@ static inline uint16_t speed_to_current_mA(uint16_t spd){ (void)spd; return CUR_
 
 // ---- WiFi (station) + MQTT configuration ----
 // Fill these in for your network / broker before flashing.
+// ENABLE_MQTT 0 = MQTT fully off (no reconnect error spam in the serial
+// CLI). Set to 1 when you have a broker running again.
+#define ENABLE_MQTT      0
 #define WIFI_SSID        "Mangdang"
 #define WIFI_PASS        "mangdang"
 #define MQTT_BROKER_URI  "mqtt://192.168.1.117:1883"
@@ -61,7 +64,29 @@ static int sg_started=0;   // Stanford gait state initialised for this activatio
 static int  CliMode = 0;
 static char cli_out[6144];   // last CLI command output, shown in the web UI
 
+// Power-on behaviour (matches mini_pupper_2_bsp): hold the NEUTRAL pose
+// (all servos centred = the Ini pose) until the user starts any motion.
+// With the neutral-angle calibration (see ik_neutral_init) the Ini pose
+// equals the IK stand at (x=0, z=NEUTRAL_Z), so every motion starts right
+// from the startup pose - no repositioning move first.
+static int started_once = 0;         // set on the first motion command
+static float pose_x = 0, pose_z = 70;    // last neutral pose, IK coords (mm)
+
+// ---- web joystick (mini_pupper_web_controller style) -------------------
+// Left pad: forward/strafe, right pad: turn. Values are set by /js and
+// consumed by the Stanford gait. Timeout -> stand (step in place).
+// EXACT Mini Pupper Config.py limits: max_x_velocity = 0.20 m/s,
+// max_y_velocity = 0.20 m/s, max_yaw_rate = 2 rad/s. Full stick == full
+// speed, same scaling as JoystickInterface.py.
+#define JOY_VX_MAX   200.0f   // mm/s forward
+#define JOY_VY_MAX   200.0f   // mm/s strafe
+#define JOY_WZ_MAX     2.0f   // rad/s yaw
+#define JOY_TIMEOUT_MS 600
+static volatile float    js_vx = 0, js_vy = 0, js_wz = 0;
+static volatile uint32_t js_last_ms = 0;
+
 static int period=80, height=70, upHeight=10, stride=10, tilt=10;
+static int sgspeed=100;   // Stanford walk speed, mm/s (max 200 = reference full stick)
 
 static uint16_t goal[13];
 static uint16_t goal_speed[13];   // legacy "speed" units; converted to mA on flush
@@ -106,6 +131,7 @@ static void reset_all_modes(void){
 // active motion's button turns it off, pressing any other turns that
 // one on (and everything else off).
 static void toggle_motion(int *flag){
+    started_once = 1;    // leave the power-on (Ini) hold
     if(*flag){ *flag=0; reset_all_modes(); }
     else     { reset_all_modes(); *flag=1; }
 }
@@ -173,6 +199,8 @@ static void cli_exec(char *cmd){
                    "  <id 1-12> fb                 present position + current\n"
                    "  dump              all 12 servos\n"
                    "  trace <id>        live position/current view (trace off = stop)\n"
+                   "  sweep [id low high hold_ms cycles hz]  PID step test -> CSV\n"
+                   "                    (serial only, needs 'cli on'; default: 2 100 200 800 3 50)\n"
                    "  save [id]         save board config to flash\n"
                    "  restore [id]      factory defaults (RAM, then save)\n"
                    "note: pos uses RAW AT32 angle, 135 = centre, no direction flip\n");
@@ -282,41 +310,101 @@ static void cli_exec(char *cmd){
 /* ---------------- serial CLI (idf.py monitor), no HTTP ------------------
  * Same commands as the web CLI, plus:
  *   cli on / cli off   toggle CLI mode (pause/resume the gait) from serial
- *   trace <id>         streams live values at 10 Hz until any key is pressed
+ *   trace <id>         background live stream at 10 Hz; other commands keep
+ *                      working while it runs. 'trace off' or 'q' stops it.
  * Runs as its own task; stdin is polled non-blocking (works on the UART
  * console and on USB-Serial-JTAG).                                        */
-static void serial_trace_stream(int id){
-    if(!CliMode){ printf("run 'cli on' first (gait would fight the SPI bus)\n"); return; }
-    printf("streaming servo %d at 10 Hz - press any key to stop\n", id);
-    static const char *mn[] = {"IDLE","POS ","TOR ","IK  "};
-    for(;;){
-        float lv[DB_LIVE_COUNT];
-        bool ok = true;
-        for(int i=0; i<DB_LIVE_COUNT && ok; i++)
-            ok = driver_board_get_live(id, i, &lv[i]);
-        if(ok){
-            int m = (int)lv[DB_LIVE_MODE];
-            printf("pos s/n/e %6.1f/%6.1f/%5.1f deg | cur c/s/n/e %4.0f/%4.0f/%4.0f/%4.0f mA"
-                   " | duty %5.1f%% | adc %4.0f/%4.0f | %s | loop %lu\n",
-                   lv[DB_LIVE_SETPOINT_POS_DEG], lv[DB_LIVE_PRESENT_POS_DEG],
-                   lv[DB_LIVE_ERROR_POS_DEG],
-                   lv[DB_LIVE_MAX_CURRENT_MA], lv[DB_LIVE_SETPOINT_CUR_MA],
-                   lv[DB_LIVE_PRESENT_CUR_MA], lv[DB_LIVE_ERROR_CUR_MA],
-                   lv[DB_LIVE_PWM_DUTY]*100.0f,
-                   lv[DB_LIVE_POS_ADC], lv[DB_LIVE_CUR_ADC],
-                   (m>=0&&m<4)?mn[m]:"?", (unsigned long)lv[DB_LIVE_LOOP_COUNTER]);
-        }else if(driver_board_poll(id)){
-            printf("pos %4u SCS  cur %5d mA  (basic - old AT32 fw)\n",
-                   driver_board_present_position(id), driver_board_present_current(id));
-        }else printf("SPI poll failed\n");
+static int TraceId = 0;                 /* 0 = off, 1-12 = servo being traced */
 
-        if(getchar() != EOF) break;          /* any key stops the stream */
-        vTaskDelay(pdMS_TO_TICKS(100));
+static void trace_print_line(int id){
+    static const char *mn[] = {"IDLE","POS ","TOR ","IK  "};
+    float lv[DB_LIVE_COUNT];
+    bool ok = true;
+    for(int i=0; i<DB_LIVE_COUNT && ok; i++)
+        ok = driver_board_get_live(id, i, &lv[i]);
+    if(ok){
+        int m = (int)lv[DB_LIVE_MODE];
+        printf("pos s/n/e %6.1f/%6.1f/%5.1f deg | cur c/s/n/e %4.0f/%4.0f/%4.0f/%4.0f mA"
+               " | duty %5.1f%% | adc %4.0f/%4.0f | %s | loop %lu\n",
+               lv[DB_LIVE_SETPOINT_POS_DEG], lv[DB_LIVE_PRESENT_POS_DEG],
+               lv[DB_LIVE_ERROR_POS_DEG],
+               lv[DB_LIVE_MAX_CURRENT_MA], lv[DB_LIVE_SETPOINT_CUR_MA],
+               lv[DB_LIVE_PRESENT_CUR_MA], lv[DB_LIVE_ERROR_CUR_MA],
+               lv[DB_LIVE_PWM_DUTY]*100.0f,
+               lv[DB_LIVE_POS_ADC], lv[DB_LIVE_CUR_ADC],
+               (m>=0&&m<4)?mn[m]:"?", (unsigned long)lv[DB_LIVE_LOOP_COUNTER]);
+    }else if(driver_board_poll(id)){
+        printf("pos %4u SCS  cur %5d mA  (basic - old AT32 fw)\n",
+               driver_board_present_position(id), driver_board_present_current(id));
+    }else printf("SPI poll failed\n");
+}
+
+/* ---- automated step-response sweep for PID tuning (serial CLI) ----------
+ * Steps ONE servo low<->high for N cycles and streams CSV over the console,
+ * so you can capture it in `idf.py monitor` and plot it. Blocks until done
+ * (runs in the console task). Requires 'cli on' so the gait doesn't fight
+ * the SPI bus. Output is framed by #SWEEP_BEGIN / #SWEEP_END so a plot
+ * script can pick the block straight out of the monitor log.              */
+static void run_sweep(int id, float low, float high,
+                      int hold_ms, int cycles, int hz){
+    if(hz < 1)   hz = 1;
+    if(hz > 200) hz = 200;
+    int period_ms = 1000 / hz;
+    const int cur = 900;                 /* max current cap during the test */
+
+    printf("#SWEEP_BEGIN id=%d low=%.1f high=%.1f hold_ms=%d cycles=%d hz=%d\n",
+           id, low, high, hold_ms, cycles, hz);
+    printf("t_ms,cmd_deg,set_deg,now_deg,err_deg,cur_mA,duty_pct\n");
+
+    /* settle at the low angle first (not logged) */
+    driver_board_direct(id, DB_MODE_POSITION, low, (int16_t)cur);
+    vTaskDelay(pdMS_TO_TICKS(600));
+
+    uint32_t t0 = millis();
+    float targets[2] = { high, low };
+    for(int c = 0; c < cycles; c++){
+        for(int leg = 0; leg < 2; leg++){
+            float tgt = targets[leg];
+            driver_board_direct(id, DB_MODE_POSITION, tgt, (int16_t)cur);
+            uint32_t seg_end = millis() + (uint32_t)hold_ms;
+            while((int32_t)(seg_end - millis()) > 0){
+                uint32_t ls = millis();
+                float lv[DB_LIVE_COUNT];
+                bool ok = true;
+                for(int i=0; i<DB_LIVE_COUNT && ok; i++)
+                    ok = driver_board_get_live(id, i, &lv[i]);
+                if(ok){
+                    printf("%lu,%.1f,%.1f,%.1f,%.1f,%.0f,%.1f\n",
+                        (unsigned long)(millis()-t0), tgt,
+                        lv[DB_LIVE_SETPOINT_POS_DEG], lv[DB_LIVE_PRESENT_POS_DEG],
+                        lv[DB_LIVE_ERROR_POS_DEG], lv[DB_LIVE_PRESENT_CUR_MA],
+                        lv[DB_LIVE_PWM_DUTY]*100.0f);
+                }else if(driver_board_poll(id)){
+                    printf("%lu,%.1f,,%.1f,,%d,\n",
+                        (unsigned long)(millis()-t0), tgt,
+                        (float)driver_board_present_position(id)*270.0f/1024.0f,
+                        driver_board_present_current(id));
+                }
+                uint32_t el = millis() - ls;
+                if((int)el < period_ms) vTaskDelay(pdMS_TO_TICKS(period_ms - (int)el));
+            }
+        }
     }
-    printf("trace stopped\n");
+    /* leave the servo idle so it isn't straining after the test */
+    driver_board_direct(id, DB_MODE_IDLE, low, 0);
+    printf("#SWEEP_END\n");
 }
 
 static void serial_handle_line(char *line){
+    if(!strncmp(line,"sweep",5)){
+        int sid=2, hold=800, cyc=3, hz=50;
+        float lo=100, hi=200;
+        sscanf(line,"sweep %d %f %f %d %d %d",&sid,&lo,&hi,&hold,&cyc,&hz);
+        if(!CliMode){ printf("run 'cli on' first (gait would fight the SPI bus)\n"); return; }
+        if(sid<1 || sid>12){ printf("bad servo id\n"); return; }
+        run_sweep(sid, lo, hi, hold, cyc, hz);
+        return;
+    }
     if(!strcmp(line,"cli on")){
         if(!CliMode){ reset_all_modes(); CliMode=1; vTaskDelay(pdMS_TO_TICKS(50)); }
         printf("CLI mode ON (gait paused, servos hold position)\n");
@@ -327,10 +415,18 @@ static void serial_handle_line(char *line){
         printf("CLI mode OFF (gait resumed)\n");
         return;
     }
+    if(!strcmp(line,"trace off")){
+        if(TraceId){ TraceId = 0; printf("trace stopped\n"); }
+        else printf("trace is not running\n");
+        return;
+    }
     int tid;
     if(sscanf(line,"trace %d",&tid)==1){
-        if(tid>=1 && tid<=12) serial_trace_stream(tid);
-        else printf("bad servo id\n");
+        if(tid<1 || tid>12){ printf("bad servo id\n"); return; }
+        if(!CliMode){ printf("run 'cli on' first (gait would fight the SPI bus)\n"); return; }
+        TraceId = tid;
+        printf("TRACE ON servo %d at 10 Hz - commands still work while it runs.\n"
+               "stop with 'trace off' or press 'q' on an empty line\n", tid);
         return;
     }
     if(!CliMode && strcmp(line,"help")!=0)
@@ -344,11 +440,28 @@ static void console_task(void *arg){
     setvbuf(stdin, NULL, _IONBF, 0);
     char line[128];
     int pos = 0;
+    uint32_t last_trace_ms = 0;
     printf("\nPupper serial CLI ready. 'cli on' to pause gait, 'help' for commands.\n> ");
     fflush(stdout);
     for(;;){
         int c = getchar();
-        if(c == EOF){ vTaskDelay(pdMS_TO_TICKS(20)); continue; }
+        if(c == EOF){
+            if(TraceId){
+                uint32_t now = millis();
+                if(now - last_trace_ms >= 100){   /* 10 Hz live stream */
+                    last_trace_ms = now;
+                    trace_print_line(TraceId);
+                    fflush(stdout);
+                }
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+        if(c=='q' && pos==0 && TraceId){          /* quick-stop the trace */
+            TraceId = 0;
+            printf("trace stopped\n> "); fflush(stdout);
+            continue;
+        }
         if(c=='\r' || c=='\n'){
             printf("\n");
             if(pos > 0){ line[pos]=0; pos=0; serial_handle_line(line); }
@@ -362,7 +475,8 @@ static void console_task(void *arg){
     }
 }
 
-// Command name -> flag table, shared between the web UI and MQTT.
+// Command name -> flag table (used by the MQTT command handler).
+#if ENABLE_MQTT
 typedef struct { const char *name; int *flag; } motion_cmd_t;
 static const motion_cmd_t motion_cmds[] = {
     {"ini",       &Ini},      {"step",      &Step},     {"roll",   &Roll},
@@ -373,6 +487,7 @@ static const motion_cmd_t motion_cmds[] = {
     {"mate",      &Mate},     {"stanford",  &Stanford},
 };
 #define MOTION_CMD_COUNT (sizeof(motion_cmds)/sizeof(motion_cmds[0]))
+#endif /* ENABLE_MQTT */
 
 static void nvs_put_float(const char*k, float v){
     nvs_set_blob(nvs, k, &v, sizeof(float)); nvs_commit(nvs);
@@ -392,15 +507,31 @@ static void servo_write(int ch, float ang){
     if(sig>1023) sig=1023;
     goal[ch] = (uint16_t)sig;
 }
+
+/* ---- neutral-angle calibration (like NEUTRAL_ANGLE_DEGREES in the BSP) --
+ * On this robot the physical standing pose is ALL SERVOS CENTRED (the Ini
+ * pose). The plain IK, however, returns big absolute angles (~44..52 deg)
+ * for the model's standing pose, so starting any motion used to reposition
+ * the legs first. Fix: command IK angles RELATIVE to the IK angles of the
+ * neutral stand (x=0, z=NEUTRAL_Z). Then fRIK(0,0,NEUTRAL_Z) == centred
+ * servos == Ini pose, and every gait starts right from the startup pose. */
+#define NEUTRAL_Z 70.0f          /* stand height that maps to servo centre */
+static float th1_neutral = 0, th2_neutral = 0;   /* radians */
+
+static void ik_neutral_init(void){
+    float ld = NEUTRAL_Z;        /* x=0 -> phi=0, ld=z */
+    th1_neutral = -acosf((L1*L1+ld*ld-L2*L2)/(2*L1*ld));
+    th2_neutral = asinf((ld*ld-L1*L1-L2*L2)/(2*L1*L2)) - th1_neutral;
+}
 static void fRIK(float x,float th0,float z){
     float zd=z/cosf(th0/180.0f*PI);
     float ld=sqrtf(x*x+zd*zd);
     float phi=atan2f(x,zd);
     float th1=phi-acosf((L1*L1+ld*ld-L2*L2)/(2*L1*ld));
     float th2=asinf((ld*ld-L1*L1-L2*L2)/(2*L1*L2))-th1;
-    servo_write(1,  th0            + offset[1]);
-    servo_write(2, -(th1*180.0f/PI)+ offset[2]);
-    servo_write(3,  th2*180.0f/PI  + offset[3]);
+    servo_write(1,  th0                            + offset[1]);
+    servo_write(2, -((th1-th1_neutral)*180.0f/PI)  + offset[2]);
+    servo_write(3,  (th2-th2_neutral)*180.0f/PI    + offset[3]);
 }
 static void rRIK(float x,float th0,float z){
     float zd=z/cosf(th0/180.0f*PI);
@@ -408,9 +539,9 @@ static void rRIK(float x,float th0,float z){
     float phi=atan2f(x,zd);
     float th1=phi-acosf((L1*L1+ld*ld-L2*L2)/(2*L1*ld));
     float th2=asinf((ld*ld-L1*L1-L2*L2)/(2*L1*L2))-th1;
-    servo_write(7,  th0            + offset[7]);
-    servo_write(8, -(th1*180.0f/PI)+ offset[8]);
-    servo_write(9,  th2*180.0f/PI  + offset[9]);
+    servo_write(7,  th0                            + offset[7]);
+    servo_write(8, -((th1-th1_neutral)*180.0f/PI)  + offset[8]);
+    servo_write(9,  (th2-th2_neutral)*180.0f/PI    + offset[9]);
 }
 static void fLIK(float x,float th0,float z){
     float zd=z/cosf(th0/180.0f*PI);
@@ -418,9 +549,9 @@ static void fLIK(float x,float th0,float z){
     float phi=atan2f(x,zd);
     float th1=phi-acosf((L1*L1+ld*ld-L2*L2)/(2*L1*ld));
     float th2=asinf((ld*ld-L1*L1-L2*L2)/(2*L1*L2))-th1;
-    servo_write(4,  th0            + offset[4]);
-    servo_write(5,  th1*180.0f/PI  + offset[5]);
-    servo_write(6, -(th2*180.0f/PI)+ offset[6]);
+    servo_write(4,  th0                            + offset[4]);
+    servo_write(5,  (th1-th1_neutral)*180.0f/PI    + offset[5]);
+    servo_write(6, -((th2-th2_neutral)*180.0f/PI)  + offset[6]);
 }
 static void rLIK(float x,float th0,float z){
     float zd=z/cosf(th0/180.0f*PI);
@@ -428,9 +559,9 @@ static void rLIK(float x,float th0,float z){
     float phi=atan2f(x,zd);
     float th1=phi-acosf((L1*L1+ld*ld-L2*L2)/(2*L1*ld));
     float th2=asinf((ld*ld-L1*L1-L2*L2)/(2*L1*L2))-th1;
-    servo_write(10, th0            + offset[10]);
-    servo_write(11, th1*180.0f/PI  + offset[11]);
-    servo_write(12,-(th2*180.0f/PI)+ offset[12]);
+    servo_write(10, th0                            + offset[10]);
+    servo_write(11, (th1-th1_neutral)*180.0f/PI    + offset[11]);
+    servo_write(12,-((th2-th2_neutral)*180.0f/PI)  + offset[12]);
 }
 
 #define ROOT_BUF_SZ 24000   /* room for the CLI dump output in the page */
@@ -485,6 +616,22 @@ static esp_err_t send_root(httpd_req_t *req){
     A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
       "style=\"background:#16a085;\"><a href=\"/stanford\" style=\"color:white;\">&#128021; Stanford Walk</a>"
       "</button></div>", ON(Stanford));
+    // Joystick pads (mini_pupper_web_controller style). Touching a pad
+    // auto-starts the Stanford trot; releasing steps in place. Each pad
+    // has a knob that follows the finger for visual feedback.
+    A("<div style=\"margin:10px auto;display:flex;justify-content:center;gap:24px;\">"
+      "<div><div id=\"padL\" style=\"position:relative;width:130px;height:130px;"
+      "border-radius:50%%;background:#e8edf2;border:2px solid #8fa1b3;"
+      "touch-action:none;-webkit-user-select:none;user-select:none;\">"
+      "<div id=\"knobL\" style=\"position:absolute;left:39px;top:39px;width:52px;"
+      "height:52px;border-radius:50%%;background:#4a6fa5;pointer-events:none;\"></div>"
+      "</div><div style=\"font-size:0.72rem;color:#666;\">move (fwd / strafe)</div></div>"
+      "<div><div id=\"padR\" style=\"position:relative;width:130px;height:130px;"
+      "border-radius:50%%;background:#f2ede8;border:2px solid #b3a18f;"
+      "touch-action:none;-webkit-user-select:none;user-select:none;\">"
+      "<div id=\"knobR\" style=\"position:absolute;left:39px;top:39px;width:52px;"
+      "height:52px;border-radius:50%%;background:#a5764a;pointer-events:none;\"></div>"
+      "</div><div style=\"font-size:0.72rem;color:#666;\">turn</div></div></div>");
     A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
       "style=\"background:#34495e;\"><a href=\"/climode\" style=\"color:white;\">&#128187; CLI Mode</a>"
       "</button></div>", ON(CliMode));
@@ -524,23 +671,31 @@ static esp_err_t send_root(httpd_req_t *req){
       "<a class=\"pm\" href=\"/strideP\">+</a><br>", stride);
     A("tilt (deg)<br><a class=\"pm\" href=\"/tiltM\">-</a><span>%d</span>"
       "<a class=\"pm\" href=\"/tiltP\">+</a><br>", tilt);
+    A("stanford speed (mm/s)<br><a class=\"pm\" href=\"/sgsM\">-</a><span>%d</span>"
+      "<a class=\"pm\" href=\"/sgsP\">+</a><br>", sgspeed);
 
-    A("<hr><h4>Servo Calibration (Offsets in degrees)</h4>"
-      "<p style=\"font-size:0.9rem;color:#666;\">Press 'Ini' first, then adjust offsets</p>");
+    A("<hr><h3>MiniPupper Calibration Tool</h3>"
+      "<p style=\"font-size:0.9rem;color:#666;\">Press 'Ini' first, then adjust offsets."
+      "<br>Each &minus; / + button = 1&deg;</p>");
 
-    const char* legN[4]={"Front Right Leg","Front Left Leg","Rear Right Leg","Rear Left Leg"};
+    const char* legN[4]={"Leg 1 (Front Right)","Leg 2 (Front Left)","Leg 3 (Rear Right)","Leg 4 (Rear Left)"};
     const char* legC[4]={"#ffe4e1","#e1f5ff","#fff4e1","#e8ffe1"};
-    const char* jN[3]={"Hip","Shoulder","Knee"};
+    const char* jN[3]={"Hip","Thigh","Calf"};
+    A("<div style=\"display:flex;justify-content:center;flex-wrap:wrap;gap:10px;\">");
     for(int leg=0; leg<4; leg++){
-        A("<div style=\"background:%s;padding:10px;margin:10px 0;border-radius:5px;\">"
-          "<strong>%s</strong><br>", legC[leg], legN[leg]);
+        A("<div style=\"background:%s;padding:12px;border-radius:8px;min-width:172px;\">"
+          "<strong>%s</strong>", legC[leg], legN[leg]);
         for(int j=0;j<3;j++){
             int id = leg*3 + j + 1;
-            A("S%d (%s): <a class=\"pm\" href=\"/cal%dM\">-</a><span>%.1f</span>"
-              "<a class=\"pm\" href=\"/cal%dP\">+</a><br>", id, jN[j], id, offset[id], id);
+            A("<div style=\"margin-top:8px;\">%s<br>"
+              "<a class=\"pm\" href=\"/cal%dM\">&minus;</a>"
+              "<span style=\"width:64px;\">%.1f&deg;</span>"
+              "<a class=\"pm\" href=\"/cal%dP\">+</a></div>",
+              jN[j], id, offset[id], id);
         }
         A("</div>");
     }
+    A("</div>");
     A("<button type=\"button\" style=\"background:#ff6b6b;color:white;width:200px;\">"
       "<a href=\"/calReset\" style=\"color:white;\">Reset All Offsets to 0</a></button><br>"
       "</div>"
@@ -554,7 +709,56 @@ static esp_err_t send_root(httpd_req_t *req){
       "window.addEventListener('beforeunload',function(){"
       "sessionStorage.setItem('sy',window.scrollY);});"
       "function swapBody(t){var d=document.implementation.createHTMLDocument('');"
-      "d.documentElement.innerHTML=t;document.body.innerHTML=d.body.innerHTML;}"
+      "d.documentElement.innerHTML=t;document.body.innerHTML=d.body.innerHTML;"
+      "if(window.initPads)initPads();}"
+      // joystick pads: knob follows the finger, values -1..1 (circle
+      // clamped), sent to /js at 10 Hz. Pointer events with touch/mouse
+      // fallback so it works on every phone/desktop browser.
+      "var jf=0,jsv=0,jt=0,jsend=0;"
+      "function mkpad(id,kid,cb){var el=document.getElementById(id);"
+      "var kn=document.getElementById(kid);if(!el||!kn||el._b)return;el._b=1;"
+      "var drag=false;"
+      "function xy(e){if(e.touches&&e.touches.length)e=e.touches[0];"
+      "return [e.clientX,e.clientY];}"
+      "function h(e){var p=xy(e),r=el.getBoundingClientRect();"
+      "var R=(r.width-kn.offsetWidth)/2;"
+      "var dx=p[0]-(r.left+r.width/2),dy=p[1]-(r.top+r.height/2);"
+      "var m=Math.sqrt(dx*dx+dy*dy);"
+      "if(m>R){dx=dx*R/m;dy=dy*R/m;}"
+      "kn.style.left=(r.width/2-kn.offsetWidth/2+dx)+'px';"
+      "kn.style.top=(r.height/2-kn.offsetHeight/2+dy)+'px';"
+      "cb(dx/R,dy/R);jsend=1;}"
+      "function rel(){if(!drag)return;drag=false;"
+      "kn.style.left=(el.offsetWidth/2-kn.offsetWidth/2)+'px';"
+      "kn.style.top=(el.offsetHeight/2-kn.offsetHeight/2)+'px';"
+      "cb(0,0);jsend=1;}"
+      "function dn(e){drag=true;h(e);e.preventDefault();}"
+      "function mv(e){if(drag){h(e);e.preventDefault();}}"
+      "if(window.PointerEvent){"
+      "el.addEventListener('pointerdown',function(e){"
+      "try{el.setPointerCapture(e.pointerId);}catch(x){}dn(e);});"
+      "el.addEventListener('pointermove',mv);"
+      "el.addEventListener('pointerup',rel);"
+      "el.addEventListener('pointercancel',rel);"
+      "}else{"
+      "el.addEventListener('touchstart',dn,{passive:false});"
+      "el.addEventListener('touchmove',mv,{passive:false});"
+      "el.addEventListener('touchend',rel);"
+      "el.addEventListener('mousedown',dn);"
+      "document.addEventListener('mousemove',mv);"
+      "document.addEventListener('mouseup',rel);}"
+      "}"
+      "function initPads(){"
+      "mkpad('padL','knobL',function(x,y){jf=-y;jsv=-x;});"
+      "mkpad('padR','knobR',function(x,y){jt=-x;});}"
+      "window.addEventListener('load',initPads);"
+      "setTimeout(initPads,300);"
+      "if(!window._jsTimer){window._jsTimer=setInterval(function(){"
+      "if(!document.getElementById('padL'))return;"
+      "if(jsend||jf||jsv||jt){"
+      "fetch('/js?f='+jf.toFixed(2)+'&s='+jsv.toFixed(2)+'&t='+jt.toFixed(2))"
+      ".catch(function(){});"
+      "if(!jf&&!jsv&&!jt)jsend=0;}},100);}"
       // web CLI (always defined, so it works after in-place body swaps too).
       // Trace runs in its OWN box (trout), so pos/tor/set/... commands keep
       // working below while the trace keeps updating.
@@ -629,6 +833,10 @@ static esp_err_t h_strM(httpd_req_t*r){ if(stride>0){stride-=2;nvs_put_int("stri
 static esp_err_t h_strP(httpd_req_t*r){ if(stride<=40){stride+=2;nvs_put_int("stride",stride);} return send_root(r);}
 static esp_err_t h_tiltM(httpd_req_t*r){ if(tilt>0){tilt-=2;nvs_put_int("tilt",tilt);} return send_root(r);}
 static esp_err_t h_tiltP(httpd_req_t*r){ if(tilt<=40){tilt+=2;nvs_put_int("tilt",tilt);} return send_root(r);}
+static esp_err_t h_sgsM(httpd_req_t*r){ if(sgspeed>20){sgspeed-=10;nvs_put_int("sgspeed",sgspeed);} return send_root(r);}
+// up to 400 mm/s: 200 = reference max (Config.py max_x_velocity); beyond
+// that is experimental - step length doubles and swings may not keep up
+static esp_err_t h_sgsP(httpd_req_t*r){ if(sgspeed<400){sgspeed+=10;nvs_put_int("sgspeed",sgspeed);} return send_root(r);}
 
 static esp_err_t h_cal(httpd_req_t*r){
     int id=0; sscanf(r->uri, "/cal%d", &id);
@@ -655,6 +863,7 @@ static esp_err_t h_leg8(httpd_req_t*r){
         if(p<0) p=0;
         if(p>1023) p=1023;
         reset_all_modes();
+        started_once=1;
         manual8_pos=(uint16_t)p;
         manual8=1;
     }
@@ -704,6 +913,42 @@ static esp_err_t h_clix(httpd_req_t*r){
     }
     httpd_resp_set_type(r, "text/plain");
     return httpd_resp_sendstr(r, cli_out);
+}
+
+// Web joystick input: /js?f=..&s=..&t=..  (each -1..1)
+//   f = forward/back, s = strafe (+left), t = turn (+left)
+// Touching a pad auto-starts the Stanford gait (like the web controller).
+static esp_err_t h_js(httpd_req_t*r){
+    char q[96], v[16];
+    float f=0, s=0, t=0;
+    if(httpd_req_get_url_query_str(r,q,sizeof q)==ESP_OK){
+        if(httpd_query_key_value(q,"f",v,sizeof v)==ESP_OK) f=strtof(v,NULL);
+        if(httpd_query_key_value(q,"s",v,sizeof v)==ESP_OK) s=strtof(v,NULL);
+        if(httpd_query_key_value(q,"t",v,sizeof v)==ESP_OK) t=strtof(v,NULL);
+    }
+    if(f> 1)f= 1;
+    if(f<-1)f=-1;
+    if(s> 1)s= 1;
+    if(s<-1)s=-1;
+    if(t> 1)t= 1;
+    if(t<-1)t=-1;
+
+    if(!CliMode && !Stanford &&
+       (fabsf(f)>0.08f || fabsf(s)>0.08f || fabsf(t)>0.08f)){
+        reset_all_modes();
+        started_once = 1;
+        Stanford = 1;              // auto-start trotting on joystick input
+    }
+    // scale everything by the web "stanford speed" setting (full stick =
+    // sgspeed mm/s; yaw scaled proportionally so turning matches)
+    float k = (float)sgspeed / JOY_VX_MAX;
+    js_vx = f * (float)sgspeed;
+    js_vy = s * JOY_VY_MAX * k;
+    js_wz = t * JOY_WZ_MAX * k;
+    js_last_ms = millis();
+
+    httpd_resp_set_type(r, "text/plain");
+    return httpd_resp_sendstr(r, "ok");
 }
 
 // Live trace poll: read ALL control-loop values of one servo over SPI
@@ -761,7 +1006,7 @@ static void reg(httpd_handle_t s,const char*uri,esp_err_t(*h)(httpd_req_t*)){
 static void start_webserver(void){
     httpd_handle_t s=NULL;
     httpd_config_t cfg=HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers=60;
+    cfg.max_uri_handlers=80;
     cfg.stack_size=8192;
     cfg.core_id = 0;
     cfg.lru_purge_enable=true;
@@ -779,11 +1024,13 @@ static void start_webserver(void){
     reg(s,"/clicmd",h_clicmd);
     reg(s,"/clix",h_clix);
     reg(s,"/tracepoll",h_tracepoll);
+    reg(s,"/js",h_js);
     reg(s,"/periodM",h_periodM); reg(s,"/periodP",h_periodP);
     reg(s,"/heightM",h_heightM); reg(s,"/heightP",h_heightP);
     reg(s,"/upHeightM",h_upM);   reg(s,"/upHeightP",h_upP);
     reg(s,"/strideM",h_strM);    reg(s,"/strideP",h_strP);
     reg(s,"/tiltM",h_tiltM);     reg(s,"/tiltP",h_tiltP);
+    reg(s,"/sgsM",h_sgsM);       reg(s,"/sgsP",h_sgsP);
     reg(s,"/calReset",h_calReset);
     reg(s,"/leg8",h_leg8);
     char uri[12];
@@ -793,6 +1040,7 @@ static void start_webserver(void){
     }
 }
 
+#if ENABLE_MQTT
 static esp_mqtt_client_handle_t mqtt_client = NULL;
 
 static void mqtt_event_handler(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data){
@@ -829,6 +1077,7 @@ static void mqtt_app_start(void){
     esp_mqtt_client_register_event(mqtt_client, ESP_EVENT_ANY_ID, mqtt_event_handler, NULL);
     esp_mqtt_client_start(mqtt_client);
 }
+#endif /* ENABLE_MQTT */
 
 static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data){
     if(event_base==WIFI_EVENT && event_id==WIFI_EVENT_STA_START){
@@ -839,7 +1088,9 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
     }else if(event_base==IP_EVENT && event_id==IP_EVENT_STA_GOT_IP){
         ip_event_got_ip_t *event = (ip_event_got_ip_t*)event_data;
         ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&event->ip_info.ip));
+#if ENABLE_MQTT
         mqtt_app_start();
+#endif
     }
 }
 
@@ -885,6 +1136,7 @@ static void gait_task(void *arg){
             servo_speed_all(0);
             for(int i=1; i<=12; i++) servo_write(i, offset[i]);
             servo_flush();
+            pose_x = 0; pose_z = NEUTRAL_Z;   // Ini == neutral stand now
             vTaskDelay(1);
 
         }else if(Step){
@@ -1221,20 +1473,57 @@ static void gait_task(void *arg){
             // sliders, so height/period/stride/upHeight are untouched.
             static int64_t sg_next_us = 0;
 
+            // Walk at the NEUTRAL height (the calibrated Ini stance), not
+            // the reference's 80 mm: the neutral-angle calibration is exact
+            // at NEUTRAL_Z, so the gait starts walking DIRECTLY from the
+            // stance the robot is already in - no dip / transition first.
+            #define SG_WALK_HEIGHT NEUTRAL_Z
+
             if(!sg_started){
-                stanford_gait_reset(SG_NATIVE_HEIGHT_MM);
-                sg_next_us = esp_timer_get_time();
+                // Short ramp only if the legs are away from the walk stance
+                // (e.g. coming from a crouched mode); from Ini/stand this is
+                // a no-op because pose == (0, NEUTRAL_Z) already.
                 servo_speed_all(0);
+                if(fabsf(pose_x) > 1.0f || fabsf(pose_z - SG_WALK_HEIGHT) > 1.0f){
+                    const int rampMs = 400;
+                    uint32_t t0 = millis();
+                    for(;;){
+                        uint32_t el = millis() - t0;
+                        if(el > (uint32_t)rampMs) el = rampMs;
+                        float f = sinf((float)el * PI / 2.0f / (float)rampMs);
+                        float x = pose_x + (0.0f           - pose_x) * f;
+                        float z = pose_z + (SG_WALK_HEIGHT - pose_z) * f;
+                        fRIK(x,0,z); fLIK(x,0,z); rRIK(x,0,z); rLIK(x,0,z);
+                        servo_flush();
+                        if(el >= (uint32_t)rampMs || !Stanford) break;
+                    }
+                }
+                pose_x = 0; pose_z = SG_WALK_HEIGHT;
+                stanford_gait_reset(SG_WALK_HEIGHT);
+                sg_next_us = esp_timer_get_time();
                 sg_started = 1;
             }
 
+            // Velocity command: joystick if fresh, else the fixed forward
+            // walk (Stanford button without touching the pads).
+            float vx = (float)sgspeed, vy = 0, wz = 0;
+            if(millis() - js_last_ms < JOY_TIMEOUT_MS){
+                vx = js_vx; vy = js_vy; wz = js_wz;
+            }
+
             sg_foot_t feet[4];
-            stanford_gait_step(SG_NATIVE_VX_MM_S, SG_NATIVE_HEIGHT_MM,
+            stanford_gait_step(vx, vy, wz, SG_WALK_HEIGHT,
                                SG_NATIVE_CLEARANCE_MM, feet);
-            fRIK(feet[0].x, 0, feet[0].z);   // Front Right
-            fLIK(feet[1].x, 0, feet[1].z);   // Front Left
-            rRIK(feet[2].x, 0, feet[2].z);   // Rear Right
-            rLIK(feet[3].x, 0, feet[3].z);   // Rear Left
+
+            // Lateral foot offset y -> hip angle th0 = atan2(y,z), with the
+            // per-leg signs taken from the existing Left/Right/Roll modes:
+            // front legs use -th0, rear legs +th0 for the same direction.
+            float t0[4];
+            for(int l=0;l<4;l++) t0[l] = atan2f(feet[l].y, feet[l].z)*180.0f/PI;
+            fRIK(feet[0].x, -t0[0], feet[0].z);   // Front Right
+            fLIK(feet[1].x, -t0[1], feet[1].z);   // Front Left
+            rRIK(feet[2].x,  t0[2], feet[2].z);   // Rear Right
+            rLIK(feet[3].x,  t0[3], feet[3].z);   // Rear Left
             servo_flush();
 
             // Pace to the next 10 ms tick; resync if we fell far behind.
@@ -1252,9 +1541,21 @@ static void gait_task(void *arg){
             servo_flush();
             vTaskDelay(1);
 
+        }else if(!started_once){
+            // POWER-ON POSE (matches mini_pupper_2_bsp): hold the neutral
+            // Ini pose - all servos centred + calibration offsets - until
+            // the user starts any motion. No IK stand at boot, so the legs
+            // no longer jerk backwards on power-up.
+            servo_speed_all(0);
+            for(int i=1; i<=12; i++) servo_write(i, offset[i]);
+            servo_flush();
+            pose_x = 0; pose_z = NEUTRAL_Z;
+            vTaskDelay(1);
+
         }else{
             fRIK(0,0,height); rRIK(0,0,height); fLIK(0,0,height); rLIK(0,0,height);
             servo_flush();
+            pose_x = 0; pose_z = height;
             vTaskDelay(1);
         }
     }
@@ -1267,12 +1568,14 @@ void app_main(void){
     }
     nvs_open("parameter", NVS_READWRITE, &nvs);
 
+    ik_neutral_init();                   // Ini pose == IK neutral stand (see comment)
     driver_board_init();                 // SPI bus + 4 AT32 driver boards + servo power ON
     vTaskDelay(pdMS_TO_TICKS(1000));     // let servo power rails settle
 
     int32_t v;
     if(nvs_get_i32(nvs,"period",&v)==ESP_OK) period=v;
     if(nvs_get_i32(nvs,"height",&v)==ESP_OK) height=v;
+    if(nvs_get_i32(nvs,"sgspeed",&v)==ESP_OK) sgspeed=v;
     for(int i=1;i<=12;i++){ char k[12]; snprintf(k,sizeof k,"offset%d",i);
         offset[i]=nvs_get_float(k, offset[i]); }
 

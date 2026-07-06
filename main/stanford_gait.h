@@ -25,8 +25,14 @@ extern "C" {
 
 typedef struct {
     float x;   /* forward offset from hip, mm (+ = forward)          */
+    float y;   /* lateral offset from hip, mm (+ = robot's LEFT)     */
     float z;   /* body height above foot, mm, downward-positive      */
 } sg_foot_t;
+
+/* leg origins in the body frame, mm (FR, FL, RR, RL) - Mini Pupper
+ * geometry: LEG_FB = 0.059 m, LEG_LR+ABDUCTION = 0.0235+0.026 m     */
+#define SG_ORIGIN_X  59.0f
+#define SG_ORIGIN_Y  49.5f
 
 /* Gait timing, ticks run at SG_DT seconds (call stanford_gait_step at
  * this rate). Values are the NATIVE Mini Pupper config from
@@ -43,10 +49,10 @@ typedef struct {
 /* Native Mini Pupper walk parameters (same Config.py):
  *   default_z_ref  = -0.08 m  -> 80 mm body height
  *   z_clearance    =  0.03 m  -> 30 mm swing lift
- *   max_x_velocity =  0.20 m/s; SG_NATIVE_VX is a half-stick walk      */
+ *   max_x_velocity =  0.20 m/s -> button walk = full-stick speed       */
 #define SG_NATIVE_HEIGHT_MM     80.0f
 #define SG_NATIVE_CLEARANCE_MM  30.0f
-#define SG_NATIVE_VX_MM_S      100.0f
+#define SG_NATIVE_VX_MM_S      200.0f
 
 /* Duration one foot spends on the ground per cycle, seconds (0.27 s). */
 float stanford_gait_stance_secs(void);
@@ -56,13 +62,16 @@ float stanford_gait_stance_secs(void);
 void stanford_gait_reset(float height_mm);
 
 /* Advance the gait one tick (SG_DT seconds) and return the four foot
- * targets.
- *   vx_mm_s      : commanded forward body velocity, mm/s
+ * targets. Full 3-axis command like the original Controller.py:
+ *   vx_mm_s      : forward body velocity, mm/s (+ = forward)
+ *   vy_mm_s      : lateral body velocity, mm/s (+ = left)
+ *   wz_rad_s     : yaw rate, rad/s (+ = turn left / CCW)
  *   height_mm    : body height reference, mm (downward-positive)
  *   clearance_mm : peak swing foot lift, mm
  *   feet[4]      : output, order FR, FL, RR, RL                       */
-void stanford_gait_step(float vx_mm_s, float height_mm,
-                        float clearance_mm, sg_foot_t feet[4]);
+void stanford_gait_step(float vx_mm_s, float vy_mm_s, float wz_rad_s,
+                        float height_mm, float clearance_mm,
+                        sg_foot_t feet[4]);
 
 #ifdef __cplusplus
 }
