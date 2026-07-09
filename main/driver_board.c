@@ -127,13 +127,16 @@ void driver_board_sync_write(const uint16_t pos[12], const uint16_t cur_mA[12])
 
         servo_cmd_sub_t *sub[3] = { &frame.s1, &frame.s2, &frame.s3 };
         for (int j = 0; j < 3; j++) {
-            int idx = b + j;
+            int idx = b + j;                     /* PHYSICAL channel index */
+            int L   = db_phys(idx + 1) - 1;      /* LOGICAL servo feeding it */
             sub[j]->mode = MODE_POSITION;
             /* SCS 0..1023 -> AT32 deci-degrees 0..2700, with the same global
              * direction flip the reference uses. Position already carries the
-             * gait's per-servo calibration offset (applied in servo_write). */
-            sub[j]->position = (uint16_t)(2700 - (uint32_t)pos[idx] * 2700u / 1024u);
-            sub[j]->torque   = (int16_t)cur_mA[idx];   /* MODE_POSITION => max current (mA) */
+             * gait's per-servo calibration offset (applied in servo_write).
+             * pos[]/cur_mA[] are indexed by logical servo, so pull the logical
+             * servo mapped to this physical channel (board-variant swap). */
+            sub[j]->position = (uint16_t)(2700 - (uint32_t)pos[L] * 2700u / 1024u);
+            sub[j]->torque   = (int16_t)cur_mA[L];   /* MODE_POSITION => max current (mA) */
             sub[j]->kp = 0;
             sub[j]->kd = 0;
             sh_mode[idx]  = MODE_POSITION;             /* keep shadow in sync */
@@ -223,8 +226,9 @@ bool driver_board_set_param(int servo, int param_id, float value)
 {
     if (servo < 1 || servo > 12 || param_id < 0 || param_id >= DB_PARAM_COUNT)
         return false;
-    return cfg_request((uint8_t)((servo - 1) / 3), CFG_OP_SET,
-                       (uint16_t)((servo - 1) % 3), (uint16_t)param_id,
+    int p = db_phys(servo) - 1;                 /* logical -> physical */
+    return cfg_request((uint8_t)(p / 3), CFG_OP_SET,
+                       (uint16_t)(p % 3), (uint16_t)param_id,
                        value, NULL);
 }
 
@@ -232,8 +236,9 @@ bool driver_board_get_param(int servo, int param_id, float *out)
 {
     if (servo < 1 || servo > 12 || param_id < 0 || param_id >= DB_PARAM_COUNT)
         return false;
-    return cfg_request((uint8_t)((servo - 1) / 3), CFG_OP_GET,
-                       (uint16_t)((servo - 1) % 3), (uint16_t)param_id,
+    int p = db_phys(servo) - 1;                 /* logical -> physical */
+    return cfg_request((uint8_t)(p / 3), CFG_OP_GET,
+                       (uint16_t)(p % 3), (uint16_t)param_id,
                        0, out);
 }
 
@@ -241,8 +246,9 @@ bool driver_board_get_live(int servo, int live_id, float *out)
 {
     if (servo < 1 || servo > 12 || live_id < 0 || live_id >= DB_LIVE_COUNT)
         return false;
-    return cfg_request((uint8_t)((servo - 1) / 3), CFG_OP_GET_LIVE,
-                       (uint16_t)((servo - 1) % 3), (uint16_t)live_id,
+    int p = db_phys(servo) - 1;                 /* logical -> physical */
+    return cfg_request((uint8_t)(p / 3), CFG_OP_GET_LIVE,
+                       (uint16_t)(p % 3), (uint16_t)live_id,
                        0, out);
 }
 
@@ -294,7 +300,7 @@ bool driver_board_direct(int servo, uint16_t mode, float pos_deg, int16_t curren
     if (pos_deg < 0)   pos_deg = 0;
     if (pos_deg > 270) pos_deg = 270;
 
-    int idx = servo - 1;
+    int idx = db_phys(servo) - 1;                  /* logical -> physical */
     sh_mode[idx]  = mode;
     sh_posdd[idx] = (uint16_t)(pos_deg * 10.0f);   /* RAW angle, no flip */
     sh_cur[idx]   = current_mA;
@@ -304,17 +310,17 @@ bool driver_board_direct(int servo, uint16_t mode, float pos_deg, int16_t curren
 bool driver_board_poll(int servo)
 {
     if (servo < 1 || servo > 12) return false;
-    return board_resend((servo - 1) / 3);
+    return board_resend((db_phys(servo) - 1) / 3);
 }
 
 int16_t driver_board_present_current(int ch)
 {
     if (ch < 1 || ch > 12) return 0;
-    return fb_current[ch - 1];
+    return fb_current[db_phys(ch) - 1];
 }
 
 uint16_t driver_board_present_position(int ch)
 {
     if (ch < 1 || ch > 12) return 0;
-    return fb_position[ch - 1];
+    return fb_position[db_phys(ch) - 1];
 }

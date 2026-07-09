@@ -201,6 +201,9 @@ static void cli_exec(char *cmd){
                    "  trace <id>        live position/current view (trace off = stop)\n"
                    "  sweep [id low high hold_ms cycles hz]  PID step test -> CSV\n"
                    "                    (serial only, needs 'cli on'; default: 2 100 200 800 3 50)\n"
+                   "  swalk [secs hz vx id...]  Stanford-walk PID trace -> CSV\n"
+                   "                    (serial only, needs 'cli on'; default: 6 50 <sgspeed> 2 3)\n"
+                   "  offsets           print all 12 servo calibration offsets (serial only)\n"
                    "  save [id]         save board config to flash\n"
                    "  restore [id]      factory defaults (RAM, then save)\n"
                    "note: pos uses RAW AT32 angle, 135 = centre, no direction flip\n");
@@ -395,6 +398,10 @@ static void run_sweep(int id, float low, float high,
     printf("#SWEEP_END\n");
 }
 
+/* defined later (needs the IK helpers + NEUTRAL_Z); runs the Stanford gait
+ * while streaming per-servo tracking CSV so you can PID-tune during the walk */
+static void run_swalk(const int *ids, int nids, int secs, int hz, float vx);
+
 static void serial_handle_line(char *line){
     if(!strncmp(line,"sweep",5)){
         int sid=2, hold=800, cyc=3, hz=50;
@@ -405,6 +412,23 @@ static void serial_handle_line(char *line){
         run_sweep(sid, lo, hi, hold, cyc, hz);
         return;
     }
+    if(!strncmp(line,"swalk",5)){
+        if(!CliMode){ printf("run 'cli on' first (gait would fight the SPI bus)\n"); return; }
+        int secs=6, hz=50, ids[12], nids=0;
+        float vx=(float)sgspeed;
+        char buf[128]; strncpy(buf,line,sizeof buf-1); buf[sizeof buf-1]=0;
+        char *sp; strtok_r(buf," \t",&sp);          /* skip "swalk" */
+        char *tok;
+        if((tok=strtok_r(NULL," \t",&sp))) secs=atoi(tok);
+        if((tok=strtok_r(NULL," \t",&sp))) hz=atoi(tok);
+        if((tok=strtok_r(NULL," \t",&sp))) vx=atof(tok);
+        while((tok=strtok_r(NULL," \t",&sp)) && nids<12){
+            int v=atoi(tok); if(v>=1 && v<=12) ids[nids++]=v;
+        }
+        if(nids==0){ ids[0]=2; ids[1]=3; nids=2; }
+        run_swalk(ids, nids, secs, hz, vx);
+        return;
+    }
     if(!strcmp(line,"cli on")){
         if(!CliMode){ reset_all_modes(); CliMode=1; vTaskDelay(pdMS_TO_TICKS(50)); }
         printf("CLI mode ON (gait paused, servos hold position)\n");
@@ -413,6 +437,15 @@ static void serial_handle_line(char *line){
     if(!strcmp(line,"cli off")){
         CliMode=0;
         printf("CLI mode OFF (gait resumed)\n");
+        return;
+    }
+    if(!strcmp(line,"offsets")){
+        static const char *nm[13] = {"",
+            "FR hip","FR thigh","FR calf",  "FL hip","FL thigh","FL calf",
+            "RR hip","RR thigh","RR calf",  "RL hip","RL thigh","RL calf"};
+        printf("servo offsets (deg), added on top of the IK angle:\n");
+        for(int i=1;i<=12;i++)
+            printf("  id %2d  %-8s  %+.1f\n", i, nm[i], offset[i]);
         return;
     }
     if(!strcmp(line,"trace off")){
@@ -508,6 +541,11 @@ static void servo_write(int ch, float ang){
     goal[ch] = (uint16_t)sig;
 }
 
+/* The board-variant servo swap (SERVO_BOARD) now lives in driver_board.h and
+ * is applied at the driver layer (db_phys), so it covers the walk, calibration,
+ * the `pos` command, sweep/swalk and feedback consistently. The IK below just
+ * uses plain logical servo ids 1..12. */
+
 /* ---- neutral-angle calibration (like NEUTRAL_ANGLE_DEGREES in the BSP) --
  * On this robot the physical standing pose is ALL SERVOS CENTRED (the Ini
  * pose). The plain IK, however, returns big absolute angles (~44..52 deg)
@@ -562,6 +600,84 @@ static void rLIK(float x,float th0,float z){
     servo_write(10, th0                            + offset[10]);
     servo_write(11, (th1-th1_neutral)*180.0f/PI    + offset[11]);
     servo_write(12,-((th2-th2_neutral)*180.0f/PI)  + offset[12]);
+}
+
+/* ---- automated walk-tune: run the Stanford trot gait while streaming
+ * per-servo tracking CSV, so you can PID-tune against the REAL walk motion
+ * (not just a step). Runs in the console task; needs 'cli on' so the gait
+ * task doesn't fight the SPI bus. Same #WALK_BEGIN / #WALK_END framing idea
+ * as run_sweep, but with one column group (set/now/err/cur/duty) per servo. */
+static void run_swalk(const int *ids, int nids, int secs, int hz, float vx){
+    if(hz < 1)   hz = 1;
+    if(hz > 100) hz = 100;
+    if(secs < 1) secs = 1;
+    if(secs > 60) secs = 60;
+    if(nids < 1) return;
+    int log_period_ms = 1000 / hz;
+
+    printf("#WALK_BEGIN secs=%d hz=%d vx=%.1f ids=", secs, hz, vx);
+    for(int k=0;k<nids;k++) printf("%s%d", k?"-":"", ids[k]);
+    printf("\n");
+    printf("t_ms");
+    for(int k=0;k<nids;k++)
+        printf(",set%d,now%d,err%d,cur%d,duty%d",
+               ids[k], ids[k], ids[k], ids[k], ids[k]);
+    printf("\n");
+
+    /* start walking from the neutral stance (same as the gait task does) */
+    servo_speed_all(0);
+    pose_x = 0; pose_z = NEUTRAL_Z;
+    stanford_gait_reset(NEUTRAL_Z);
+
+    uint32_t t0 = millis();
+    uint32_t end_ms = t0 + (uint32_t)secs * 1000u;
+    uint32_t next_log = t0;
+    int64_t  next_us = esp_timer_get_time();
+
+    while(millis() < end_ms && CliMode){
+        sg_foot_t feet[4];
+        stanford_gait_step(vx, 0.0f, 0.0f, NEUTRAL_Z,
+                           SG_NATIVE_CLEARANCE_MM, feet);
+        float th0[4];
+        for(int l=0;l<4;l++) th0[l] = atan2f(feet[l].y, feet[l].z)*180.0f/PI;
+        fRIK(feet[0].x, -th0[0], feet[0].z);   /* Front Right */
+        fLIK(feet[1].x, -th0[1], feet[1].z);   /* Front Left  */
+        rRIK(feet[2].x,  th0[2], feet[2].z);   /* Rear Right  */
+        rLIK(feet[3].x,  th0[3], feet[3].z);   /* Rear Left   */
+        servo_flush();
+
+        uint32_t now_ms = millis();
+        if((int32_t)(now_ms - next_log) >= 0){
+            next_log += log_period_ms;
+            printf("%lu", (unsigned long)(now_ms - t0));
+            for(int k=0;k<nids;k++){
+                int id = ids[k];
+                float set_deg=0, now_deg=0, err_deg=0, cur=0, duty=0;
+                bool ok = driver_board_get_live(id, DB_LIVE_SETPOINT_POS_DEG, &set_deg)
+                       && driver_board_get_live(id, DB_LIVE_PRESENT_POS_DEG, &now_deg)
+                       && driver_board_get_live(id, DB_LIVE_ERROR_POS_DEG,   &err_deg)
+                       && driver_board_get_live(id, DB_LIVE_PRESENT_CUR_MA,  &cur)
+                       && driver_board_get_live(id, DB_LIVE_PWM_DUTY,        &duty);
+                if(ok) printf(",%.1f,%.1f,%.1f,%.0f,%.1f",
+                              set_deg, now_deg, err_deg, cur, duty*100.0f);
+                else   printf(",,,,,");
+            }
+            printf("\n");
+        }
+
+        /* pace to the next SG_DT (15 ms) gait tick; resync if we fell behind */
+        next_us += (int64_t)(SG_DT * 1e6f);
+        int64_t now = esp_timer_get_time();
+        if(now > next_us + 100000) next_us = now;
+        while(esp_timer_get_time() < next_us && CliMode) vTaskDelay(1);
+    }
+
+    /* park the legs back in the neutral stand so they aren't mid-stride */
+    fRIK(0,0,NEUTRAL_Z); fLIK(0,0,NEUTRAL_Z);
+    rRIK(0,0,NEUTRAL_Z); rLIK(0,0,NEUTRAL_Z);
+    servo_flush();
+    pose_x = 0; pose_z = NEUTRAL_Z;
+    printf("#WALK_END\n");
 }
 
 #define ROOT_BUF_SZ 24000   /* room for the CLI dump output in the page */

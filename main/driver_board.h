@@ -32,6 +32,36 @@
 extern "C" {
 #endif
 
+/* ------------------------------------------------------------------------
+ * SERVO BOARD VARIANT SELECT
+ *   1 = normal  (this robot, as wired now)
+ *   2 = swapped (the other build: in each leg the HIP and CALF servos are
+ *                plugged the other way round -> physical channels swapped
+ *                1<->3, 4<->6, 7<->9, 10<->12; thighs 2,5,8,11 unchanged)
+ *
+ * db_phys() maps a LOGICAL servo id (what the gait / IK / CLI / calibration
+ * all use, 1..12) to the PHYSICAL channel on the driver boards. Doing the
+ * remap HERE - at the single hardware boundary - means every path agrees:
+ * the walk, the `pos` command, sweep/swalk, position feedback and the
+ * offset[] calibration all address the same servo by the same id. Set
+ * SERVO_BOARD and re-flash to switch builds.
+ * ---------------------------------------------------------------------- */
+#define SERVO_BOARD 2
+
+static inline int db_phys(int logical){
+#if SERVO_BOARD == 2
+    switch(logical){
+        case 1:  return 3;   case 3:  return 1;
+        case 4:  return 6;   case 6:  return 4;
+        case 7:  return 9;   case 9:  return 7;
+        case 10: return 12;  case 12: return 10;
+        default: return logical;
+    }
+#else
+    return logical;
+#endif
+}
+
 /* Initialise the SPI bus, the 4 driver-board devices, and the power-enable pin.
  * Leaves servo power ON (GPIO8 high). Call once at start-up. */
 void driver_board_init(void);
