@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<!--
+  stanford_controller.html - standalone Stanford / mini_pupper web controller
+  for the ESP-only Mini Pupper 2 Pro firmware (minipupperesp).
+
+  Mirrors the mangdang mini_pupper_web_controller command model exactly:
+    left  stick  -> f (forward/back), s (strafe, + = left)
+    right stick  -> t (turn, + = left / CCW)
+  and posts them to the firmware's joystick endpoint:
+    GET /js?f=<-1..1>&s=<-1..1>&t=<-1..1>
+  which the firmware maps to  vx = f*speed,  vy = s*200mm/s,  wz = t*2rad/s
+  (BSP: max_x_velocity=0.20, max_y_velocity=0.20, max_yaw_rate=2).
+
+  Open this file in a browser (phone or desktop), type the robot's IP, hold a
+  pad. Touching a pad auto-starts the Stanford trot, releasing steps in place.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Mini Pupper - Stanford Walk</title>
+<style>
+  :root { --bg:#0f1720; --card:#16212e; --ink:#e8eef4; --mut:#7d90a3;
+          --accent:#16a085; --pad:#1e2c3a; --knob:#16a085; }
+  * { box-sizing:border-box; -webkit-user-select:none; user-select:none; touch-action:none; }
+  body { margin:0; background:var(--bg); color:var(--ink);
+         font-family:system-ui,Segoe UI,Roboto,sans-serif; }
+  header { padding:14px 16px; display:flex; align-items:center; gap:10px;
+           background:var(--card); border-bottom:1px solid #24333f; }
+  header h1 { font-size:16px; margin:0; font-weight:600; }
+  header .dot { width:10px; height:10px; border-radius:50%; background:#c0392b; }
+  header .dot.ok { background:var(--accent); }
+  .bar { padding:12px 16px; display:flex; flex-wrap:wrap; gap:10px; align-items:center;
+         background:var(--card); border-bottom:1px solid #24333f; }
+  .bar input { background:#0d151d; border:1px solid #2a3a48; color:var(--ink);
+               border-radius:8px; padding:8px 10px; font-size:14px; width:150px; }
+  .bar label { color:var(--mut); font-size:13px; }
+  .bar .val { color:var(--accent); font-weight:600; min-width:64px; text-align:right; }
+  .pads { display:flex; gap:18px; justify-content:center; flex-wrap:wrap;
+          padding:26px 16px; }
+  .padwrap { text-align:center; }
+  .padwrap .cap { color:var(--mut); font-size:12px; margin-bottom:8px; }
+  .pad { width:min(42vw,240px); height:min(42vw,240px); border-radius:50%;
+         background:radial-gradient(circle at 50% 42%, #223040, var(--pad));
+         border:1px solid #2c3d4c; position:relative; touch-action:none; }
+  .knob { width:34%; height:34%; border-radius:50%; background:var(--knob);
+          position:absolute; left:33%; top:33%; box-shadow:0 6px 18px rgba(0,0,0,.4);
+          transition:transform .04s linear; }
+  .tele { display:flex; gap:18px; justify-content:center; color:var(--mut);
+          font-size:13px; padding:0 16px 22px; flex-wrap:wrap; }
+  .tele b { color:var(--ink); font-variant-numeric:tabular-nums; }
+  footer { color:var(--mut); font-size:11px; text-align:center; padding:0 16px 26px; line-height:1.5; }
+</style>
+</head>
+<body>
+<header>
+  <span class="dot" id="dot"></span>
+  <h1>Mini Pupper - Stanford Walk</h1>
+</header>
+
+<div class="bar">
+  <label>Robot IP</label>
+  <input id="ip" placeholder="192.168.x.x" inputmode="decimal">
+  <label>Speed cap</label>
+  <span class="val" id="spd">- mm/s</span>
+</div>
+
+<div class="pads">
+  <div class="padwrap">
+    <div class="cap">MOVE&nbsp;&nbsp;(fwd / strafe)</div>
+    <div class="pad" id="padL"><div class="knob" id="knobL"></div></div>
+  </div>
+  <div class="padwrap">
+    <div class="cap">TURN&nbsp;&nbsp;(yaw)</div>
+    <div class="pad" id="padR"><div class="knob" id="knobR"></div></div>
+  </div>
+</div>
+
+<div class="tele">
+  <div>f <b id="tf">0.00</b></div>
+  <div>s <b id="ts">0.00</b></div>
+  <div>t <b id="tt">0.00</b></div>
+  <div>vx <b id="tvx">0</b> mm/s</div>
+  <div>wz <b id="twz">0.00</b> rad/s</div>
+</div>
+
+<footer>
+  Command model matches mini_pupper_2pro_bsp: full stick = 200&nbsp;mm/s (0.20&nbsp;m/s),
+  yaw = 2&nbsp;rad/s. Touch a pad to start trotting; release to step in place.<br>
+  Sends GET /js?f&amp;s&amp;t to the firmware ~20x/s. Set the robot IP above first.
+</footer>
+
+<script>
+(function(){
+  var MAX_VX = 200, MAX_WZ = 2.0;          // BSP full-stick references
+  var f=0, s=0, t=0, speed=100;
+  var ipEl=document.getElementById('ip'), dot=document.getElementById('dot');
+  var spdEl=document.getElementById('spd');
+  var tf=document.getElementById('tf'), ts=document.getElementById('ts'),
+      tt=document.getElementById('tt'), tvx=document.getElementById('tvx'),
+      twz=document.getElementById('twz');
+
+  // remember IP within the session (no storage APIs needed)
+  ipEl.value = (window.__ip||'');
+  ipEl.addEventListener('input', function(){ window.__ip = ipEl.value.trim(); });
+
+  function bindPad(padId, knobId, onMove, vertical, both){
+    var pad=document.getElementById(padId), knob=document.getElementById(knobId);
+    var active=false, id=null;
+    function pos(e){
+      var r=pad.getBoundingClientRect();
+      var cx=r.left+r.width/2, cy=r.top+r.height/2;
+      var px=(e.clientX-cx)/(r.width/2), py=(e.clientY-cy)/(r.height/2);
+      var m=Math.hypot(px,py); if(m>1){ px/=m; py/=m; }
+      if(!both){ if(vertical) px=0; else py=0; }
+      knob.style.transform='translate('+(px*100)+'%,'+(py*100)+'%)';
+      onMove(px, -py);   // screen y down -> command up positive
+    }
+    function end(){ active=false; id=null; knob.style.transform='translate(0,0)'; onMove(0,0); }
+    pad.addEventListener('pointerdown', function(e){ active=true; id=e.pointerId;
+      pad.setPointerCapture(e.pointerId); pos(e); e.preventDefault(); });
+    pad.addEventListener('pointermove', function(e){ if(active&&e.pointerId===id) pos(e); });
+    pad.addEventListener('pointerup', end);
+    pad.addEventListener('pointercancel', end);
+  }
+
+  // left pad: y = forward (f), x = strafe (s, +right on screen -> firmware s is +left, so negate)
+  bindPad('padL','knobL', function(x,y){ f=y; s=-x; }, false, true);
+  // right pad: x = turn (t, +right on screen -> +CW; firmware t is +left/CCW, so negate)
+  bindPad('padR','knobR', function(x,y){ t=-x; }, false, false);
+
+  function send(){
+    tf.textContent=f.toFixed(2); ts.textContent=s.toFixed(2); tt.textContent=t.toFixed(2);
+    tvx.textContent=Math.round(f*speed); twz.textContent=(t*MAX_WZ).toFixed(2);
+    var ip=(window.__ip||ipEl.value||'').trim();
+    if(!ip) return;
+    var url='http://'+ip+'/js?f='+f.toFixed(3)+'&s='+s.toFixed(3)+'&t='+t.toFixed(3);
+    fetch(url,{mode:'no-cors'}).then(function(){ dot.classList.add('ok'); })
+                              .catch(function(){ dot.classList.remove('ok'); });
+  }
+  setInterval(send, 50);   // 20 Hz, well within the 600 ms joystick timeout
+
+  // pull the current speed cap from the firmware status if reachable
+  function poll(){
+    var ip=(window.__ip||ipEl.value||'').trim(); if(!ip){ spdEl.textContent='- mm/s'; return; }
+    fetch('http://'+ip+'/api/status').then(function(r){return r.json();})
+      .then(function(d){ if(d&&d.sgspeed){ speed=d.sgspeed; } spdEl.textContent=speed+' mm/s'; })
+      .catch(function(){ spdEl.textContent=speed+' mm/s (offline)'; });
+  }
+  setInterval(poll, 2000); poll();
+})();
+</script>
+</body>
+</html>

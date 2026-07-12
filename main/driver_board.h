@@ -34,10 +34,14 @@ extern "C" {
 
 /* ------------------------------------------------------------------------
  * SERVO BOARD VARIANT SELECT
- *   1 = normal  (this robot, as wired now)
+ *   1 = normal  (black board - this robot, as wired now)
  *   2 = swapped (the other build: in each leg the HIP and CALF servos are
  *                plugged the other way round -> physical channels swapped
  *                1<->3, 4<->6, 7<->9, 10<->12; thighs 2,5,8,11 unchanged)
+ *   3 = purple board  (same design as board 1, but the 1-2-3 group sits where
+ *                4-5-6 is and 7-8-9 where 10-11-12 is, AND the hip/knee (2nd &
+ *                3rd servo) are reversed within each leg. Net remap, verified
+ *                on hardware: 1<->4, 2<->6, 3<->5, 7<->10, 8<->12, 9<->11.)
  *
  * db_phys() maps a LOGICAL servo id (what the gait / IK / CLI / calibration
  * all use, 1..12) to the PHYSICAL channel on the driver boards. Doing the
@@ -46,7 +50,7 @@ extern "C" {
  * offset[] calibration all address the same servo by the same id. Set
  * SERVO_BOARD and re-flash to switch builds.
  * ---------------------------------------------------------------------- */
-#define SERVO_BOARD 2
+#define SERVO_BOARD 1
 
 static inline int db_phys(int logical){
 #if SERVO_BOARD == 2
@@ -55,6 +59,19 @@ static inline int db_phys(int logical){
         case 4:  return 6;   case 6:  return 4;
         case 7:  return 9;   case 9:  return 7;
         case 10: return 12;  case 12: return 10;
+        default: return logical;
+    }
+#elif SERVO_BOARD == 3
+    /* purple board: 1-2-3 group swapped with 4-5-6, 7-8-9 with 10-11-12,
+     * AND the hip/knee (2nd & 3rd servo) reversed within each leg. Net
+     * (verified on hardware): 1<->4, 2<->6, 3<->5, 7<->10, 8<->12, 9<->11. */
+    switch(logical){
+        case 1:  return 4;   case 4:  return 1;
+        case 2:  return 6;   case 6:  return 2;
+        case 3:  return 5;   case 5:  return 3;
+        case 7:  return 10;  case 10: return 7;
+        case 8:  return 12;  case 12: return 8;
+        case 9:  return 11;  case 11: return 9;
         default: return logical;
     }
 #else

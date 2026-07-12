@@ -164,6 +164,15 @@ def main():
         sys.exit(1)
     path = sys.argv[1]
 
+    # motion label from the log filename: jump.log / stretch.log / walk.log
+    _base = os.path.basename(path).lower()
+    if "jump" in _base:
+        _MOTION = "jump"
+    elif "stretch" in _base:
+        _MOTION = "stretch"
+    else:
+        _MOTION = "walk"
+
     meta, header, rows = extract_last_block(read_lines(path))
     if not rows or header is None:
         print("No walk data found. Did you run 'cli on' then 'swalk' and "
@@ -221,7 +230,7 @@ def main():
         ax = axes[0][j]
         ax.plot(ts, setp, color="#888", linewidth=1.4, label="commanded (setpoint)")
         ax.plot(ts, now, color="#1f77b4", linewidth=1.6, label="actual (trace)")
-        ax.set_title(f"Servo {sid} - walk step response")
+        ax.set_title(f"Servo {sid} - {_MOTION} step response")
         if j == 0:
             ax.set_ylabel("angle (deg)")
         ax.grid(True, alpha=0.3)
@@ -259,9 +268,14 @@ def main():
             axc.tick_params(axis="y", labelcolor="#d62728")
         ax.set_xlabel("time (s)")
 
-    ttl = "Stanford walk PID trace"
-    if meta["vx"] is not None:
-        ttl += f"  (vx={meta['vx']:g} mm/s)"
+    if _MOTION == "jump":
+        ttl = "In-place Jump PID trace"
+    elif _MOTION == "stretch":
+        ttl = "Stretch-bob PID trace"
+    else:
+        ttl = "Stanford walk PID trace"
+        if meta["vx"] is not None:
+            ttl += f"  (vx={meta['vx']:g} mm/s)"
     fig.suptitle(ttl, fontsize=13)
 
     base = os.path.splitext(path)[0]

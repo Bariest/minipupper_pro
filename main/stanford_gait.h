@@ -35,23 +35,31 @@ typedef struct {
 #define SG_ORIGIN_Y  49.5f
 
 /* Gait timing, ticks run at SG_DT seconds (call stanford_gait_step at
- * this rate). Values are the NATIVE Mini Pupper config from
- * mangdangroboticsclub/mini_pupper_bsp (MangDang/mini_pupper/Config.py):
+ * this rate). Values are the NATIVE Mini Pupper 2 (Pro) hardware config,
+ * verified directly against the live repo:
+ *   mangdangroboticsclub/mini_pupper_2_bsp, branch mini_pupper_2pro_bsp,
+ *   Python_Module/MangDang/mini_pupper/Config.py
+ * (this is the robot-specific config; the generic StanfordQuadruped repo
+ * still carries the original FULL-SIZE Stanford Pupper's numbers and is
+ * NOT representative of this hardware - do not diff against it):
  *   dt = 0.015 s, overlap_time = 0.09 s, swing_time = 0.1 s
  *   -> overlap_ticks = int(0.09/0.015) = 6
- *   -> swing_ticks   = int(0.10/0.015) = 6   (Python int() truncates)  */
+ *   -> swing_ticks   = int(0.10/0.015) = 6   (Python int() truncates)   */
 #define SG_DT            0.015f
 #define SG_OVERLAP_TICKS 6
 #define SG_SWING_TICKS   6
 #define SG_STANCE_TICKS  (2*SG_OVERLAP_TICKS + SG_SWING_TICKS)   /* 18 */
 #define SG_PHASE_LENGTH  (2*SG_OVERLAP_TICKS + 2*SG_SWING_TICKS) /* 24 */
 
-/* Native Mini Pupper walk parameters (same Config.py):
- *   default_z_ref  = -0.08 m  -> 80 mm body height
- *   z_clearance    =  0.03 m  -> 30 mm swing lift
- *   max_x_velocity =  0.20 m/s -> button walk = full-stick speed       */
+/* Same Config.py, confirmed to match this board almost exactly (LEG_L1
+ * 50mm == our L1 exactly; LEG_L2 60mm vs our calibrated 56mm; default_z_ref
+ * 80mm vs our calibrated NEUTRAL_Z 70mm - small, deliberate calibration
+ * deltas, not a different-scale robot). No rescaling needed or applied:
+ *   default_z_ref = -0.08 m -> 80 mm body height
+ *   z_clearance   =  0.03 m -> 30 mm swing lift
+ *   max_x_velocity = max_y_velocity = 0.20 m/s -> 200 mm/s full-stick     */
 #define SG_NATIVE_HEIGHT_MM     80.0f
-#define SG_NATIVE_CLEARANCE_MM  30.0f
+#define SG_NATIVE_CLEARANCE_MM  20.0f
 #define SG_NATIVE_VX_MM_S      200.0f
 
 /* Duration one foot spends on the ground per cycle, seconds (0.27 s). */

@@ -1,0 +1,781 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>MangDang Servo Studio</title><!-- v5: clean light theme -->
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+:root{
+  --bg:#f5f7fa; --panel:#ffffff; --panel2:#fafbfc; --raise:#f1f4f8;
+  --line:#e6eaef; --line2:#d5dce4;
+  --txt:#1f2937; --mut:#64748b; --dim:#94a3b8;
+  --acc:#f59e0b; --acc2:#f97316; --blue:#2563eb;
+  --ok:#16a34a; --bad:#dc2626;
+  --grad:linear-gradient(120deg,#f59e0b,#f97316);
+  --shadow:0 1px 3px rgba(16,24,40,.06),0 4px 14px rgba(16,24,40,.05);
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+::-webkit-scrollbar{width:10px;height:10px;}
+::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:8px;border:2px solid var(--bg);}
+::-webkit-scrollbar-track{background:transparent;}
+body{font-family:"Segoe UI Variable","Segoe UI",Inter,Roboto,Arial,sans-serif;
+     font-size:13px;background:var(--bg);color:var(--txt);height:100vh;
+     display:flex;flex-direction:column;overflow:hidden;}
+button{font-family:inherit;}
+.mono{font-family:"Cascadia Code",Consolas,Menlo,monospace;font-variant-numeric:tabular-nums;}
+/* ================= top bar ================= */
+#bar{background:var(--panel);border-bottom:1px solid var(--line);
+     padding:8px 16px;display:flex;gap:8px;align-items:center;flex-shrink:0;
+     box-shadow:0 1px 2px rgba(16,24,40,.04);}
+#brand{display:flex;align-items:center;gap:11px;margin-right:16px;}
+#paw{width:36px;height:36px;border-radius:11px;display:flex;align-items:center;
+     justify-content:center;font-size:20px;background:var(--grad);
+     box-shadow:0 3px 10px rgba(245,158,11,.35);}
+#brand b{font-family:"Arial Black","Segoe UI Black","Segoe UI",sans-serif;
+     font-size:17px;font-weight:900;letter-spacing:-.4px;display:block;
+     line-height:1.1;color:#0a0a0a;}
+#brand small{color:var(--dim);font-size:10px;letter-spacing:1.6px;font-weight:600;}
+.btngrp{display:flex;gap:2px;background:var(--panel2);border:1px solid var(--line);
+     border-radius:11px;padding:3px;}
+#bar button{background:none;border:none;border-radius:8px;padding:5px 13px;
+     cursor:pointer;text-align:center;font-size:10.5px;color:var(--mut);
+     transition:background .15s,color .15s;}
+#bar button:hover{background:#e9eef4;color:var(--txt);}
+#bar button .ic{display:block;font-size:16px;line-height:19px;}
+#conn{min-width:96px;}
+#conn .dot{display:inline-block;width:8px;height:8px;border-radius:50%;
+     margin-right:6px;background:#9ca3af;vertical-align:1px;}
+#conn.on{color:var(--txt);}
+#conn.on .dot{background:var(--ok);box-shadow:0 0 6px rgba(22,163,74,.6);animation:pulse 2s infinite;}
+#conn.off .dot{background:var(--bad);}
+@keyframes pulse{50%{box-shadow:0 0 1px rgba(22,163,74,.3);}}
+#banner{margin-left:auto;font-size:11px;color:var(--bad);max-width:330px;
+     text-align:right;padding:5px 12px;border:1px solid var(--line);
+     border-radius:99px;background:var(--panel2);}
+#banner.ok{color:var(--ok);border-color:#c7ebd4;background:#f0fbf4;}
+/* ================= layout ================= */
+#main{flex:1;display:flex;min-height:0;padding:12px;gap:12px;}
+/* ---- left tree ---- */
+#tree{width:222px;background:var(--panel);border:1px solid var(--line);
+      border-radius:14px;overflow-y:auto;padding:10px 8px;flex-shrink:0;
+      box-shadow:var(--shadow);}
+#tree .logo{padding:4px 10px 10px;border-bottom:1px solid var(--line);margin-bottom:6px;}
+#tree .logo b{font-family:"Arial Black","Segoe UI Black","Segoe UI",sans-serif;
+      font-size:16px;font-weight:900;letter-spacing:-.4px;color:#0a0a0a;display:block;}
+#tree .logo small{color:var(--dim);font-size:9px;letter-spacing:1.4px;font-weight:600;}
+#tree .root{padding:7px 10px 3px;font-size:12px;font-weight:700;color:#111827;
+      white-space:nowrap;}
+#tree .root .arr{color:var(--dim);margin-right:4px;}
+#tree .grp{padding:8px 10px 4px 20px;font-size:10px;font-weight:700;color:var(--mut);
+      display:flex;align-items:center;gap:6px;white-space:nowrap;}
+#tree .grp .arr{color:var(--dim);}
+#tree .grp::before{content:"";width:7px;height:7px;border-radius:2px;background:var(--gc,#2563eb);}
+#tree .sv{margin-left:26px;}
+#tree .sv{padding:7px 11px;cursor:pointer;white-space:nowrap;border-radius:9px;
+      margin:1px 2px;display:flex;align-items:center;gap:9px;color:#374151;
+      transition:background .15s,transform .1s;}
+#tree .sv:hover{background:var(--raise);transform:translateX(2px);}
+#tree .sv.sel{background:var(--grad);color:#fff;font-weight:600;
+      box-shadow:0 3px 10px rgba(245,158,11,.35);}
+#tree .sv .tag{display:inline-block;background:#eef2f7;color:#b45309;
+      border-radius:7px;font-size:10px;font-weight:700;min-width:24px;
+      text-align:center;padding:2px 4px;font-variant-numeric:tabular-nums;}
+#tree .sv.sel .tag{background:rgba(255,255,255,.25);color:#fff;}
+#tree .sv.miss{opacity:.35;}
+#tree .sv.miss .tag{color:var(--mut);}
+/* ---- center ---- */
+#mid{flex:1;overflow:auto;background:var(--panel);border:1px solid var(--line);
+     border-radius:14px;min-width:340px;box-shadow:var(--shadow);}
+table{border-collapse:collapse;width:100%;}
+th{position:sticky;top:0;background:#f8fafc;border-bottom:1px solid var(--line2);
+   text-align:left;padding:9px 14px;font-weight:600;z-index:1;font-size:10px;
+   color:var(--mut);text-transform:uppercase;letter-spacing:1.2px;}
+td{padding:7px 14px;border-bottom:1px solid var(--line);
+   font-family:"Cascadia Code",Consolas,Menlo,monospace;font-variant-numeric:tabular-nums;
+   color:#111827;}
+tr.p{cursor:pointer;transition:background .12s;}
+tr.p:hover td{background:#f4f8fd;}
+tr.sel td{background:#fdf3e3 !important;}
+tr.sel td:first-child{box-shadow:inset 3px 0 0 var(--acc);}
+td.adr span{background:#fef3c7;color:#b45309;border-radius:7px;
+   padding:2px 8px;font-size:10.5px;font-weight:700;}
+tr.ram td.adr span{background:#dbeafe;color:#1d4ed8;}
+tr.sect td{background:#f8fafc;font-weight:700;font-family:inherit;
+   color:var(--dim);font-size:9.5px;text-transform:uppercase;letter-spacing:1.6px;
+   padding:9px 14px;}
+td.dim{color:var(--dim);}
+/* ---- right column ---- */
+#right{width:318px;flex-shrink:0;display:flex;flex-direction:column;
+       overflow-y:auto;gap:12px;}
+.pane{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+      box-shadow:var(--shadow);}
+.pane .bd{padding:12px;}
+.ttl{background:var(--grad);color:#fff;text-align:center;font-size:13.5px;
+     font-weight:700;padding:9px 6px;border-radius:13px 13px 0 0;letter-spacing:.3px;}
+.rowbtns{display:flex;gap:8px;padding:10px 12px 0;}
+.rowbtns button{flex:1;background:var(--panel);border:1px solid var(--line2);
+     border-radius:9px;padding:7px 4px;cursor:pointer;font-size:11px;
+     color:#374151;transition:background .15s,border-color .15s;}
+.rowbtns button:hover{background:var(--raise);border-color:var(--acc);}
+/* gauge + toggles */
+#gaugewrap{display:flex;align-items:center;gap:10px;padding:10px 12px 0;}
+#gauge{flex-shrink:0;}
+.tglrow{display:flex;align-items:center;justify-content:space-between;margin:7px 0;
+     font-size:12px;color:#374151;}
+.tgl{position:relative;width:42px;height:22px;border-radius:12px;background:#d1d9e2;
+     cursor:pointer;transition:background .18s;flex-shrink:0;}
+.tgl.on{background:var(--acc);box-shadow:0 0 8px rgba(245,158,11,.35);}
+.tgl::after{content:"";position:absolute;top:2px;left:2px;width:18px;height:18px;
+     border-radius:50%;background:#fff;transition:left .18s;
+     box-shadow:0 1px 3px rgba(16,24,40,.25);}
+.tgl.on::after{left:22px;}
+/* meters */
+.meter{padding:7px 12px 0;}
+.mlab{display:flex;justify-content:space-between;font-size:10.5px;color:var(--mut);
+     margin-bottom:4px;text-transform:uppercase;letter-spacing:.8px;}
+.mlab span{color:var(--txt);font-family:Consolas,monospace;text-transform:none;}
+.mbar{height:6px;border-radius:4px;background:#eef2f7;overflow:hidden;}
+.mbar div{height:100%;width:0%;border-radius:4px;background:var(--grad);
+     transition:width .25s ease;}
+#mdutyf{background:linear-gradient(90deg,#16a34a,#4ade80);}
+/* live value table */
+.lv{width:100%;border-collapse:collapse;}
+.lv td{border:none;border-bottom:1px solid var(--line);padding:6px 4px;font-size:12px;}
+.lv tr:last-child td{border-bottom:none;}
+.lv td:first-child{font-family:inherit;font-weight:600;color:var(--mut);width:47%;}
+.lv td:last-child{text-align:right;color:var(--txt);}
+/* editor */
+#edttl{background:var(--grad);color:#fff;text-align:center;font-size:12.5px;
+     font-weight:700;padding:8px 6px;border-radius:13px 13px 0 0;letter-spacing:.3px;}
+#edmeta{font-size:12px;line-height:1.6;padding:11px 12px;}
+#edmeta b{display:inline-block;width:62px;color:var(--dim);font-size:10px;
+     text-transform:uppercase;letter-spacing:1px;}
+#edlist{max-height:150px;overflow-y:auto;border:1px solid var(--line2);
+     border-radius:9px;margin:0 12px;}
+#edlist .op{padding:6px 13px;cursor:pointer;font-family:Consolas,monospace;
+     transition:background .12s;color:#374151;}
+#edlist .op:hover{background:var(--raise);}
+#edlist .op.sel{background:var(--acc);color:#fff;font-weight:700;}
+#edinrow{padding:11px 12px 4px;display:flex;gap:6px;align-items:center;}
+#edin{flex:1;padding:8px 12px;border:1px solid var(--line2);border-radius:9px;
+     font-family:Consolas,monospace;font-size:13px;background:var(--panel);
+     color:var(--txt);outline:none;transition:border-color .15s,box-shadow .15s;}
+#edin:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(245,158,11,.15);}
+#edrange{display:block;margin:2px 12px 6px;width:calc(100% - 24px);accent-color:var(--acc);}
+#setbtn{margin:2px 12px 10px;padding:10px 0;width:calc(100% - 24px);
+     background:var(--grad);color:#fff;border:none;border-radius:9px;
+     cursor:pointer;font-weight:700;font-size:13px;letter-spacing:.3px;
+     transition:filter .15s,transform .1s;box-shadow:0 3px 10px rgba(245,158,11,.3);}
+#setbtn:hover{filter:brightness(1.05);transform:translateY(-1px);}
+#setbtn:active{transform:translateY(0);}
+#edmsg{padding:0 12px 6px;font-size:11px;min-height:16px;}
+#edmsg.ok{color:var(--ok);} #edmsg.err{color:var(--bad);}
+.hint{color:var(--dim);font-size:10.5px;padding:0 12px 12px;line-height:1.5;}
+/* toast */
+#toast{position:fixed;bottom:18px;left:50%;transform:translate(-50%,20px);
+     background:#1f2937;color:#fff;font-weight:600;padding:10px 22px;
+     border-radius:11px;z-index:9;box-shadow:0 8px 28px rgba(16,24,40,.35);
+     opacity:0;pointer-events:none;transition:opacity .2s,transform .2s;}
+#toast.show{opacity:1;transform:translate(-50%,0);}
+/* ================= graph ================= */
+#gpanel{display:none;flex-direction:column;height:100%;}
+#gbar{padding:9px 12px;border-bottom:1px solid var(--line);display:flex;gap:6px;
+     align-items:center;}
+#gbar button{background:var(--panel);border:1px solid var(--line2);border-radius:9px;
+     padding:6px 15px;cursor:pointer;font-size:12px;color:#374151;
+     transition:background .15s,border-color .15s;}
+#gbar button:hover{background:var(--raise);border-color:var(--acc);}
+#gbar #gstart.run{background:var(--bad);color:#fff;border-color:var(--bad);}
+#ginfo{margin-left:auto;font-size:11px;color:var(--mut);font-variant-numeric:tabular-nums;}
+#glegend{padding:8px 12px;display:flex;gap:7px;flex-wrap:wrap;
+     border-bottom:1px solid var(--line);}
+#glegend .tr{display:flex;align-items:center;gap:6px;cursor:pointer;font-size:11px;
+     padding:4px 11px;border-radius:99px;user-select:none;color:#374151;
+     border:1px solid var(--line2);background:var(--panel);
+     transition:opacity .15s,background .15s;}
+#glegend .tr:hover{background:var(--raise);}
+#glegend .tr.off{opacity:.35;}
+#glegend .sw{width:13px;height:7px;border-radius:2px;display:inline-block;}
+#gwrap{flex:1;min-height:0;padding:10px;}
+#gcv{width:100%;height:100%;display:block;background:#fff;
+     border:1px solid var(--line2);border-radius:10px;}
+</style>
+</head>
+<body>
+
+<div id="bar">
+  <div id="brand"><span id="paw">&#128062;</span>
+    <div><b>MangDang</b><small>MINI PUPPER &middot; SERVO STUDIO</small></div></div>
+  <div class="btngrp">
+    <button onclick="location.href='/'"><span class="ic">&#127918;</span>Control</button>
+    <button id="conn" class="off" onclick="toggleConn()"><span class="ic"><span class="dot"></span></span><span id="connlbl">Connect</span></button>
+    <button onclick="scanServos()"><span class="ic">&#128269;</span>Scan</button>
+    <button onclick="refreshSel()"><span class="ic">&#8635;</span>Refresh</button>
+  </div>
+  <div class="btngrp">
+    <button id="gbtn" onclick="toggleGraph()"><span class="ic">&#128200;</span>Graph</button>
+  </div>
+  <div class="btngrp">
+    <button onclick="saveFlash(cur)"><span class="ic">&#128190;</span>Save</button>
+    <button onclick="saveFlash(0)"><span class="ic">&#128190;</span>Save All</button>
+  </div>
+  <span id="banner">checking...</span>
+</div>
+
+<div id="main">
+  <div id="tree"></div>
+
+  <div id="mid">
+    <div id="tblwrap">
+    <table id="tbl">
+      <thead><tr><th style="width:64px;">Addr</th><th>Parameter</th><th style="width:90px;">Value</th><th style="width:110px;">Actual</th></tr></thead>
+      <tbody id="tb"></tbody>
+    </table>
+    </div>
+    <div id="gpanel">
+      <div id="gbar">
+        <button id="gstart" onclick="gStartStop()">&#9654; Start</button>
+        <button onclick="gReset()">&#8634; Reset</button>
+        <button onclick="gCapture()">&#128247; Capture</button>
+        <button onclick="gSaveCsv()">&#128190; Save</button>
+        <button onclick="$('gfile').click()">&#128194; Load</button>
+        <input type="file" id="gfile" accept=".csv" style="display:none;">
+        <span id="ginfo"></span>
+      </div>
+      <div id="glegend"></div>
+      <div id="gwrap"><canvas id="gcv"></canvas></div>
+    </div>
+  </div>
+
+  <div id="right">
+    <div class="pane">
+      <div class="ttl" id="svttl">no servo selected</div>
+      <div class="rowbtns">
+        <button onclick="factoryReset()">&#9888; Factory Reset</button>
+        <button onclick="saveFlash(cur)">&#128190; Save to Flash</button>
+      </div>
+      <div id="gaugewrap">
+        <svg id="gauge" width="128" height="114" viewBox="0 0 120 108">
+          <defs><linearGradient id="ggrad" x1="0" y1="1" x2="1" y2="0">
+            <stop offset="0" stop-color="#f97316"/><stop offset="1" stop-color="#fbbf24"/>
+          </linearGradient></defs>
+          <path d="M 26.06 93.94 A 48 48 0 1 1 93.94 93.94" fill="none"
+                stroke="#e9eef4" stroke-width="9" stroke-linecap="round"/>
+          <path id="garc" d="M 26.06 93.94 A 48 48 0 1 1 93.94 93.94" fill="none"
+                stroke="url(#ggrad)" stroke-width="9" stroke-linecap="round"
+                stroke-dasharray="0 226.2"/>
+          <text id="gtxt" x="60" y="60" text-anchor="middle" fill="#111827"
+                font-size="19" font-weight="700"
+                font-family="Consolas,monospace">&mdash;</text>
+          <text x="60" y="74" text-anchor="middle" fill="#94a3b8" font-size="8.5"
+                letter-spacing="1.5">DEGREES</text>
+          <text x="25" y="106" text-anchor="middle" fill="#cbd5e1" font-size="8">0</text>
+          <text x="95" y="106" text-anchor="middle" fill="#cbd5e1" font-size="8">270</text>
+        </svg>
+        <div style="flex:1;">
+          <div class="tglrow"><span>Torque</span><div id="tqTgl" class="tgl" onclick="toggleTorque()"></div></div>
+          <div style="font-size:10.5px;color:var(--dim);line-height:1.4;">hold position / motor off</div>
+          <div class="tglrow" style="margin-top:10px;"><span>Live poll</span><div id="lpTgl" class="tgl on" onclick="togglePoll()"></div></div>
+        </div>
+      </div>
+      <div class="meter"><div class="mlab">Current <span id="mcur">&mdash;</span></div>
+        <div class="mbar"><div id="mcurf"></div></div></div>
+      <div class="meter"><div class="mlab">PWM Duty <span id="mduty">&mdash;</span></div>
+        <div class="mbar"><div id="mdutyf"></div></div></div>
+      <div class="bd">
+        <table class="lv"><tbody>
+          <tr><td>Position</td><td id="lv_pos">&mdash; [&deg;]</td></tr>
+          <tr><td>Goal</td><td id="lv_set">&mdash; [&deg;]</td></tr>
+          <tr><td>Pos Error</td><td id="lv_err">&mdash; [&deg;]</td></tr>
+          <tr><td>Current</td><td id="lv_cur">&mdash; [mA]</td></tr>
+          <tr><td>Current Cap</td><td id="lv_cap">&mdash; [mA]</td></tr>
+          <tr><td>PWM Duty</td><td id="lv_duty">&mdash; [%]</td></tr>
+          <tr><td>Mode</td><td id="lv_mode">&mdash;</td></tr>
+        </tbody></table>
+      </div>
+    </div>
+
+    <div class="pane">
+      <div id="edttl">select a parameter</div>
+      <div id="edmeta"></div>
+      <div id="edlist" style="display:none;"></div>
+      <input id="edrange" type="range" style="display:none;">
+      <div id="edinrow" style="display:none;">
+        <input id="edin" type="text" autocomplete="off">
+      </div>
+      <button id="setbtn" style="display:none;" onclick="applyParam()">&#10003; Set</button>
+      <div id="edmsg"></div>
+      <div class="hint">Set writes to RAM only &mdash; use "Save to Flash" to keep values after power-off.</div>
+    </div>
+  </div>
+</div>
+<div id="toast"></div>
+
+<script>
+"use strict";
+/* ------- static config: mirror of the AT32 sms_config table ------- */
+var PARAMS=[
+ {p:0,name:"reverse_position_sensor",type:"bool",desc:"Invert the position sensor direction."},
+ {p:1,name:"min_position_adc",type:"int",min:0,max:4096,step:1,unit:"",desc:"ADC reading at the low end of travel."},
+ {p:2,name:"max_position_adc",type:"int",min:0,max:4096,step:1,unit:"",desc:"ADC reading at the high end of travel."},
+ {p:3,name:"range_position_deg",type:"int",min:0,max:360,step:1,unit:"°",desc:"Mechanical range of the output shaft."},
+ {p:4,name:"reverse_motor",type:"bool",desc:"Invert the motor drive direction."},
+ {p:5,name:"kp_position",type:"num",min:0,max:1000,step:1,unit:"",desc:"Position loop proportional gain."},
+ {p:6,name:"kd_position",type:"num",min:0,max:20000,step:10,unit:"",desc:"Position loop derivative gain (damping)."},
+ {p:7,name:"kp_current",type:"num",min:0,max:0.01,step:0.0001,unit:"",desc:"Current loop proportional gain."},
+ {p:8,name:"kff_current",type:"num",min:0,max:0.01,step:0.00001,unit:"",desc:"Current loop feed-forward gain."},
+ {p:9,name:"max_pwm_duty_cycle",type:"num",min:0,max:1,step:0.01,unit:"",desc:"PWM duty limit, 0..1 (1 = full voltage)."}
+];
+var LIVE=[
+ {k:"now_deg", a:100,name:"Present Position",unit:"°",dp:1},
+ {k:"set_deg", a:101,name:"Goal Position",unit:"°",dp:1},
+ {k:"err_deg", a:102,name:"Position Error",unit:"°",dp:1},
+ {k:"now_ma",  a:103,name:"Present Current",unit:"mA",dp:0},
+ {k:"cap_ma",  a:104,name:"Current Limit (cap)",unit:"mA",dp:0},
+ {k:"set_ma",  a:105,name:"Current Setpoint",unit:"mA",dp:0},
+ {k:"duty",    a:106,name:"PWM Duty",unit:"%",dp:1,scale:100},
+ {k:"pos_adc", a:107,name:"Position ADC (raw)",unit:"",dp:0},
+ {k:"cur_adc", a:108,name:"Current ADC (raw)",unit:"",dp:0},
+ {k:"mode",    a:109,name:"Operating Mode",unit:"",dp:0},
+ {k:"loop",    a:110,name:"Loop Counter",unit:"",dp:0}
+];
+var LEGS=[["Front Right",1,"#2563eb"],["Front Left",4,"#16a34a"],
+          ["Rear Right",7,"#9333ea"],["Rear Left",10,"#dc2626"]];
+var JOINT=["Hip","Thigh","Calf"];
+var MODES=["IDLE","POSITION","TORQUE","IK"];
+
+var cli=0, cur=0, selP=-1, vals={}, live={}, torque=false, polling=true, pollT=null;
+
+function $(i){return document.getElementById(i);}
+function jget(u){return fetch(u).then(function(r){return r.json();});}
+function toast(m){var t=$("toast");t.textContent=m;t.classList.add("show");
+  clearTimeout(t._t);t._t=setTimeout(function(){t.classList.remove("show");},1800);}
+
+/* ---------------- tree (Dynamixel-Wizard-style port hierarchy) -------- */
+var CSPIN=[9,10,21,14];   /* chip-select GPIO per driver board (FR FL RR RL) */
+function pad3(n){ return ("00"+n).slice(-3); }
+function buildTree(){
+  var h='<div class="logo"><b>MangDang</b><small>SERVO STUDIO</small></div>';
+  h+='<div class="root"><span class="arr">&#9662;</span>SPI2 &middot; ESP32</div>';
+  h+='<div class="root" style="padding-left:20px;"><span class="arr">&#9662;</span>AT32F413 &times; 4</div>';
+  LEGS.forEach(function(g,gi){
+    h+='<div class="grp" style="--gc:'+g[2]+';"><span class="arr">&#9662;</span>'+
+       g[0]+' &middot; CS'+CSPIN[gi]+'</div>';
+    for(var j=0;j<3;j++){
+      var id=g[1]+j;
+      h+='<div class="sv" id="sv'+id+'" onclick="selServo('+id+')">'+
+         '<span class="tag">'+id+'</span>[ID:'+pad3(id)+'] '+JOINT[j]+'</div>';
+    }
+  });
+  $("tree").innerHTML=h;
+}
+
+/* ---------------- param table ---------------- */
+function buildTable(){
+  var h='<tr class="sect"><td colspan="4">Configuration &mdash; stored per servo</td></tr>';
+  PARAMS.forEach(function(P){
+    h+='<tr class="p" id="row'+P.p+'" onclick="selParam('+P.p+')">'+
+       '<td class="adr"><span>'+P.p+'</span></td><td>'+P.name+'</td>'+
+       '<td id="v'+P.p+'" class="dim">&mdash;</td><td id="a'+P.p+'" class="dim"></td></tr>';
+  });
+  h+='<tr class="sect"><td colspan="4">Live telemetry &mdash; read-only</td></tr>';
+  LIVE.forEach(function(L){
+    h+='<tr class="ram"><td class="adr"><span>'+L.a+'</span></td><td>'+L.name+'</td>'+
+       '<td id="lvv'+L.a+'" class="dim">&mdash;</td><td id="lva'+L.a+'" class="dim"></td></tr>';
+  });
+  $("tb").innerHTML=h;
+}
+
+function fmtActual(P,v){
+  if(v===null||v===undefined) return "";
+  if(P.type==="bool") return v? "yes (1)":"no (0)";
+  return v+(P.unit?" ["+P.unit+"]":"");
+}
+
+function selServo(id){
+  if(!cli){ toast("Connect first (pauses the gait)"); return; }
+  cur=id; selP=-1; vals={};
+  document.querySelectorAll("#tree .sv").forEach(function(e){e.classList.remove("sel");});
+  $("sv"+id).classList.add("sel");
+  $("svttl").textContent="Servo "+id+" — "+legName(id);
+  clearEditor();
+  buildTable();
+  jget("/api/dump?id="+id).then(function(d){
+    if(!d.ok){ toast("dump failed: "+d.err); return; }
+    d.params.forEach(function(pv){
+      vals[pv.p]=pv.v;
+      var P=PARAMS[pv.p], c=$("v"+pv.p), a=$("a"+pv.p);
+      if(pv.v===null){ c.textContent="no reply"; return; }
+      c.textContent=pv.v; c.classList.remove("dim");
+      a.textContent=fmtActual(P,pv.v); a.classList.remove("dim");
+    });
+  }).catch(function(){ toast("dump request failed"); });
+}
+function legName(id){
+  var ln=["Front Right","Front Left","Rear Right","Rear Left"][(id-1)/3|0];
+  return ln+" "+JOINT[(id-1)%3];
+}
+function refreshSel(){ if(cur) selServo(cur); else toast("select a servo first"); }
+
+/* Scan: probe all 12 ids over SPI, grey out the ones that don't answer */
+function scanServos(){
+  if(!cli){ toast("Connect first"); return; }
+  toast("scanning 12 servos...");
+  jget("/api/scan").then(function(d){
+    if(!d.ok){ toast("scan failed: "+d.err); return; }
+    for(var id=1; id<=12; id++)
+      $("sv"+id).classList.toggle("miss", d.found.indexOf(id)<0);
+    toast("scan complete: "+d.found.length+"/12 servos responding");
+    if(d.found.length && (!cur || d.found.indexOf(cur)<0)) selServo(d.found[0]);
+    else if(cur) selServo(cur);
+  }).catch(function(){ toast("scan request failed"); });
+}
+
+/* ---------------- editor ---------------- */
+function clearEditor(){
+  $("edttl").textContent="select a parameter";
+  $("edmeta").innerHTML=""; $("edlist").style.display="none";
+  $("edinrow").style.display="none"; $("edrange").style.display="none";
+  $("setbtn").style.display="none"; setMsg("","");
+}
+function setMsg(m,cls){ var e=$("edmsg"); e.textContent=m; e.className=cls; }
+
+function selParam(p){
+  if(!cur){ toast("select a servo first"); return; }
+  selP=p;
+  document.querySelectorAll("#tb tr").forEach(function(e){e.classList.remove("sel");});
+  $("row"+p).classList.add("sel");
+  var P=PARAMS[p], v=vals[p];
+  $("edttl").textContent=P.name;
+  $("edmeta").innerHTML="<b>Address</b> "+p+"<br><b>Value</b> <span id='edcur' class='mono'>"+
+      (v===null?"no reply":v)+"</span><br><span style='color:var(--mut);'>"+P.desc+"</span>";
+  setMsg("","");
+  if(P.type==="bool"){
+    $("edinrow").style.display="none"; $("edrange").style.display="none";
+    var el=$("edlist"); el.style.display="block";
+    el.innerHTML='<div class="op'+(v==0?" sel":"")+'" onclick="pickOp(0,this)">0 &mdash; off / normal</div>'+
+                 '<div class="op'+(v==1?" sel":"")+'" onclick="pickOp(1,this)">1 &mdash; on / reversed</div>';
+    $("edin").value=(v==null?0:v);
+  }else{
+    $("edlist").style.display="none";
+    var r=$("edrange");
+    r.style.display="block"; r.min=P.min; r.max=P.max; r.step=P.step;
+    r.value=(v==null?P.min:v);
+    r.oninput=function(){ $("edin").value=r.value; };
+    $("edinrow").style.display="flex";
+    $("edin").value=(v==null?"":v);
+    $("edin").oninput=function(){ r.value=$("edin").value; };
+  }
+  $("setbtn").style.display="block";
+}
+function pickOp(v,el){
+  document.querySelectorAll("#edlist .op").forEach(function(e){e.classList.remove("sel");});
+  el.classList.add("sel"); $("edin").value=v;
+}
+function applyParam(){
+  if(!cur||selP<0) return;
+  var v=parseFloat($("edin").value);
+  if(isNaN(v)){ setMsg("not a number","err"); return; }
+  var P=PARAMS[selP];
+  if(v<P.min||v>P.max){ setMsg("out of range ("+P.min+" .. "+P.max+")","err"); return; }
+  setMsg("writing...","");
+  jget("/api/set?id="+cur+"&p="+selP+"&v="+v).then(function(d){
+    if(!d.ok){ setMsg("set failed: "+d.err,"err"); return; }
+    vals[selP]=d.v;
+    $("v"+selP).textContent=d.v;
+    $("a"+selP).textContent=fmtActual(P,d.v);
+    var ec=$("edcur"); if(ec) ec.textContent=d.v;
+    setMsg("OK — readback "+d.v+" (RAM only, Save to keep)","ok");
+  }).catch(function(){ setMsg("request failed","err"); });
+}
+
+/* ---------------- live polling ---------------- */
+var pollBusy=false;   /* don't stack requests if the ESP32 replies slowly */
+function pollLive(){
+  if(!cli||!cur||pollBusy||(!polling&&!grun)) return;
+  pollBusy=true;
+  jget("/api/live?id="+cur).then(function(d){
+    pollBusy=false;
+    if(!d.ok) return;
+    live=d;
+    gPush(d);
+    LIVE.forEach(function(L){
+      var v=d[L.k];
+      var c=$("lvv"+L.a), a=$("lva"+L.a);
+      if(v===undefined||!c) return;
+      var s=(L.scale?v*L.scale:v).toFixed(L.dp);
+      c.textContent=s; c.classList.remove("dim");
+      a.textContent=(L.k==="mode")?(MODES[v]||"?"):(L.unit?s+" ["+L.unit+"]":"");
+      a.classList.remove("dim");
+    });
+    if(d.now_deg!==undefined){
+      $("lv_pos").innerHTML=d.now_deg.toFixed(1)+" [&deg;]";
+      var fr=Math.max(0,Math.min(1,d.now_deg/270));
+      $("garc").setAttribute("stroke-dasharray",(226.2*fr).toFixed(1)+" 226.2");
+      $("gtxt").textContent=d.now_deg.toFixed(1);
+    }
+    if(d.set_deg!==undefined)$("lv_set").innerHTML=d.set_deg.toFixed(1)+" [&deg;]";
+    if(d.err_deg!==undefined)$("lv_err").innerHTML=d.err_deg.toFixed(1)+" [&deg;]";
+    if(d.now_ma !==undefined){
+      $("lv_cur").textContent=d.now_ma.toFixed(0)+" [mA]";
+      $("mcur").textContent=d.now_ma.toFixed(0)+" mA"+
+        (d.cap_ma!==undefined?" / "+d.cap_ma.toFixed(0):"");
+      var cp=(d.cap_ma>0)?Math.min(100,Math.abs(d.now_ma)/d.cap_ma*100):0;
+      $("mcurf").style.width=cp.toFixed(0)+"%";
+    }
+    if(d.cap_ma !==undefined)$("lv_cap").textContent=d.cap_ma.toFixed(0)+" [mA]";
+    if(d.duty   !==undefined){
+      $("lv_duty").textContent=(d.duty*100).toFixed(1)+" [%]";
+      $("mduty").textContent=(d.duty*100).toFixed(1)+" %";
+      $("mdutyf").style.width=Math.min(100,Math.abs(d.duty)*100).toFixed(0)+"%";
+    }
+    if(d.mode   !==undefined){
+      $("lv_mode").textContent=MODES[d.mode]||"?";
+      torque = (d.mode==1||d.mode==2);
+      $("tqTgl").classList.toggle("on",torque);
+    }
+  }).catch(function(){ pollBusy=false; });
+}
+function togglePoll(){
+  polling=!polling;
+  $("lpTgl").classList.toggle("on",polling);
+}
+function toggleTorque(){
+  if(!cli||!cur){ toast("connect + select a servo"); return; }
+  if(torque){
+    jget("/api/direct?id="+cur+"&m=0").then(function(d){
+      if(d.ok){ torque=false; $("tqTgl").classList.remove("on"); toast("motor off"); }
+    });
+  }else{
+    var deg=(live.now_deg!==undefined)?live.now_deg:135;
+    jget("/api/direct?id="+cur+"&m=1&deg="+deg.toFixed(1)+"&cur=200").then(function(d){
+      if(d.ok){ torque=true; $("tqTgl").classList.add("on"); toast("holding "+deg.toFixed(1)+"°"); }
+    });
+  }
+}
+
+/* ---------------- connect / save / restore ---------------- */
+function setConn(on){
+  cli=on?1:0;
+  $("conn").className=on?"on":"off";
+  $("connlbl").textContent=on?"Disconnect":"Connect";
+  $("banner").textContent=on?"tuning mode ON — gait paused, parameter access OK"
+                            :"tuning mode OFF — press Connect to pause the gait and edit parameters";
+  $("banner").className=on?"ok":"";
+}
+function toggleConn(){
+  jget("/api/climode?on="+(cli?0:1)).then(function(d){ setConn(d.climode);
+    if(d.climode&&!cur) selServo(1);
+  }).catch(apiFail);
+}
+function saveFlash(id){
+  if(!cli){ toast("Connect first"); return; }
+  if(id&&!cur){ toast("select a servo first"); return; }
+  jget("/api/save?id="+(id||0)).then(function(d){
+    toast(d.ok?("saved to flash ("+(id?("board of servo "+id):"all boards")+")"):"save FAILED");
+  });
+}
+function factoryReset(){
+  if(!cli||!cur){ toast("connect + select a servo"); return; }
+  if(!confirm("Factory reset the board of servo "+cur+" (3 servos)?\nRAM only - Save to keep."))return;
+  jget("/api/restore?id="+cur).then(function(d){
+    toast(d.ok?"factory defaults loaded (RAM)":"restore FAILED");
+    if(d.ok) selServo(cur);
+  });
+}
+
+/* ================= graph mode ================= */
+var TRACES=[
+ {k:"now_deg",name:"Present Position",unit:"°", color:"#eab308",axis:0,on:true},
+ {k:"set_deg",name:"Goal Position",   unit:"°", color:"#dc2626",axis:0,on:true},
+ {k:"err_deg",name:"Position Error",  unit:"°", color:"#ea580c",axis:0,on:false},
+ {k:"now_ma", name:"Present Current", unit:"mA",color:"#2563eb",axis:1,on:true},
+ {k:"cap_ma", name:"Current Cap",     unit:"mA",color:"#6b7280",axis:1,on:false},
+ {k:"duty",   name:"PWM Duty ×10",    unit:"%", color:"#16a34a",axis:1,on:false,scale:1000}
+];
+var gview=false, grun=false, gt0=0, gbuf=[], GWIN=15000, GMAX=6000;
+
+function toggleGraph(){
+  gview=!gview;
+  $("tblwrap").style.display=gview?"none":"";
+  $("gpanel").style.display=gview?"flex":"none";
+  $("gbtn").style.background=gview?"#e9eef4":"";
+  if(gview){ buildLegend(); gResize(); gDraw(); }
+}
+function buildLegend(){
+  var h="";
+  TRACES.forEach(function(T,i){
+    h+='<span class="tr'+(T.on?"":" off")+'" id="leg'+i+'" onclick="legTgl('+i+')">'+
+       '<span class="sw" style="background:'+T.color+';"></span>'+T.name+
+       ' <span style="color:var(--dim);">['+T.unit+(T.axis?", right":", left")+']</span></span>';
+  });
+  $("glegend").innerHTML=h;
+}
+function legTgl(i){
+  TRACES[i].on=!TRACES[i].on;
+  $("leg"+i).classList.toggle("off",!TRACES[i].on);
+  gDraw();
+}
+function gStartStop(){
+  if(!grun){
+    if(!cli||!cur){ toast("connect + select a servo first"); return; }
+    if(!gbuf.length) gt0=Date.now();
+    grun=true;
+    $("gstart").innerHTML="&#9632; Stop"; $("gstart").classList.add("run");
+  }else{
+    grun=false;
+    $("gstart").innerHTML="&#9654; Start"; $("gstart").classList.remove("run");
+  }
+}
+function gReset(){ gbuf=[]; gt0=Date.now(); gDraw(); $("ginfo").textContent=""; }
+function gPush(d){
+  if(!grun) return;
+  var pt={t:Date.now()-gt0};
+  TRACES.forEach(function(T){ if(d[T.k]!==undefined) pt[T.k]=d[T.k]; });
+  gbuf.push(pt);
+  if(gbuf.length>GMAX) gbuf.shift();
+  $("ginfo").textContent="servo "+cur+" · "+gbuf.length+" samples · "+
+      ((pt.t)/1000).toFixed(1)+" s";
+  if(gview) gDraw();
+}
+function gResize(){
+  var c=$("gcv"), w=$("gwrap");
+  c.width=w.clientWidth-20; c.height=w.clientHeight-20;
+}
+window.addEventListener("resize",function(){ if(gview){gResize();gDraw();} });
+
+function niceScale(mn,mx){
+  if(!isFinite(mn)||!isFinite(mx)){ mn=0; mx=1; }
+  if(mn===mx){ mn-=1; mx+=1; }
+  var span=mx-mn, step=Math.pow(10,Math.floor(Math.log(span/5)/Math.LN10));
+  var e=span/5/step;
+  step*= e>=5?5 : e>=2?2 : 1;
+  return {min:Math.floor(mn/step)*step, max:Math.ceil(mx/step)*step, step:step};
+}
+function gDraw(){
+  var c=$("gcv"); if(!c.width) gResize();
+  var x=c.getContext("2d"), W=c.width, H=c.height;
+  var L=58,R=64,T=14,B=26, pw=W-L-R, ph=H-T-B;
+  x.fillStyle="#ffffff"; x.fillRect(0,0,W,H);
+  if(pw<50||ph<50) return;
+  if(!gbuf.length){
+    x.fillStyle="#b6c2d1"; x.font="13px 'Segoe UI',sans-serif";
+    x.textAlign="center"; x.textBaseline="middle";
+    x.fillText("Press ▶ Start to record live servo data", W/2, H/2);
+    return;
+  }
+  var tmax=gbuf[gbuf.length-1].t, tmin=Math.max(0,tmax-GWIN);
+  var ax=[{mn:Infinity,mx:-Infinity},{mn:Infinity,mx:-Infinity}];
+  gbuf.forEach(function(p){
+    if(p.t<tmin) return;
+    TRACES.forEach(function(Tr){
+      if(!Tr.on||p[Tr.k]===undefined) return;
+      var v=p[Tr.k]*(Tr.scale||1), a=ax[Tr.axis];
+      if(v<a.mn)a.mn=v; if(v>a.mx)a.mx=v;
+    });
+  });
+  if(!isFinite(ax[0].mn)){ ax[0].mn=0; ax[0].mx=270; }
+  if(!isFinite(ax[1].mn)){ ax[1].mn=-500; ax[1].mx=1500; }
+  var s0=niceScale(ax[0].mn,ax[0].mx), s1=niceScale(ax[1].mn,ax[1].mx);
+  function Y0(v){ return T+ph-(v-s0.min)/(s0.max-s0.min)*ph; }
+  function Y1(v){ return T+ph-(v-s1.min)/(s1.max-s1.min)*ph; }
+  function X(t){ return L+(t-tmin)/(tmax-tmin||1)*pw; }
+  x.font="10px Consolas,monospace"; x.strokeStyle="#eef1f5"; x.fillStyle="#8496aa";
+  x.textAlign="right"; x.textBaseline="middle";
+  for(var v=s0.min; v<=s0.max+1e-9; v+=s0.step){
+    var y=Y0(v);
+    x.beginPath(); x.moveTo(L,y); x.lineTo(L+pw,y); x.stroke();
+    x.fillText((+v.toFixed(6)).toLocaleString(), L-6, y);
+  }
+  x.textAlign="left";
+  for(v=s1.min; v<=s1.max+1e-9; v+=s1.step)
+    x.fillText((+v.toFixed(6)).toLocaleString(), L+pw+6, Y1(v));
+  x.textAlign="center"; x.textBaseline="top";
+  var tstep=(tmax-tmin)/6;
+  for(var t=tmin; t<=tmax+1; t+=tstep){
+    var px=X(t);
+    x.strokeStyle="#f3f5f8";
+    x.beginPath(); x.moveTo(px,T); x.lineTo(px,T+ph); x.stroke();
+    x.fillText((t/1000).toFixed(2), px, T+ph+6);
+  }
+  if(s1.min<0&&s1.max>0){
+    x.strokeStyle="#d5dce4"; x.beginPath();
+    x.moveTo(L,Y1(0)); x.lineTo(L+pw,Y1(0)); x.stroke();
+  }
+  TRACES.forEach(function(Tr){
+    if(!Tr.on) return;
+    x.strokeStyle=Tr.color; x.lineWidth=1.7; x.beginPath();
+    var started=false;
+    gbuf.forEach(function(p){
+      if(p.t<tmin||p[Tr.k]===undefined) return;
+      var v=p[Tr.k]*(Tr.scale||1);
+      var py=Tr.axis?Y1(v):Y0(v), px=X(p.t);
+      if(!started){ x.moveTo(px,py); started=true; } else x.lineTo(px,py);
+    });
+    x.stroke();
+  });
+  x.lineWidth=1;
+  x.fillStyle="#94a3b8"; x.textAlign="center";
+  x.save(); x.translate(12,T+ph/2); x.rotate(-Math.PI/2);
+  x.fillText("Position [deg]",0,0); x.restore();
+  x.save(); x.translate(W-10,T+ph/2); x.rotate(Math.PI/2);
+  x.fillText("Current [mA] / Duty [x10 %]",0,0); x.restore();
+}
+
+/* Capture = PNG snapshot of the plot, Save = CSV, Load = CSV back in */
+function gCapture(){
+  var a=document.createElement("a");
+  a.download="graph_servo"+(cur||0)+"_"+Date.now()+".png";
+  a.href=$("gcv").toDataURL("image/png"); a.click();
+}
+function gSaveCsv(){
+  if(!gbuf.length){ toast("no data - press Start first"); return; }
+  var cols=["t_ms"]; TRACES.forEach(function(T){cols.push(T.k);});
+  var s=cols.join(",")+"\n";
+  gbuf.forEach(function(p){
+    s+=cols.map(function(k){return p[k]!==undefined?p[k]:"";}).join(",")+"\n";
+  });
+  var a=document.createElement("a");
+  a.download="graph_servo"+(cur||0)+"_"+Date.now()+".csv";
+  a.href=URL.createObjectURL(new Blob([s],{type:"text/csv"})); a.click();
+}
+$("gfile").addEventListener("change",function(){
+  var f=this.files[0]; if(!f) return;
+  var rd=new FileReader();
+  rd.onload=function(){
+    var lines=rd.result.split(/\r?\n/), hdr=lines[0].split(",");
+    gbuf=[];
+    for(var i=1;i<lines.length;i++){
+      if(!lines[i]) continue;
+      var cel=lines[i].split(","), pt={};
+      hdr.forEach(function(h,j){
+        if(cel[j]!=="") pt[h==="t_ms"?"t":h]=parseFloat(cel[j]);
+      });
+      if(pt.t!==undefined) gbuf.push(pt);
+    }
+    grun=false;
+    $("gstart").innerHTML="&#9654; Start"; $("gstart").classList.remove("run");
+    $("ginfo").textContent="loaded "+gbuf.length+" samples from "+f.name;
+    if(!gview) toggleGraph(); else gDraw();
+  };
+  rd.readAsText(f); this.value="";
+});
+
+/* ---------------- init ---------------- */
+buildTree(); buildTable(); clearEditor(); buildLegend();
+function apiFail(){
+  $("banner").className="";
+  $("banner").textContent="cannot reach the robot API - open this page as http://<robot-ip>/wizard (retrying...)";
+}
+jget("/api/status").then(function(d){ setConn(d.climode); }).catch(apiFail);
+/* 100 ms tick: full rate while the graph records, 400 ms otherwise */
+var tick=0;
+pollT=setInterval(function(){
+  tick++;
+  if(grun || tick%4===0) pollLive();
+},100);
+setInterval(function(){ jget("/api/status").then(function(d){
+  setConn(d.climode); }).catch(apiFail); },3000);
+</script>
+</body>
+</html>
