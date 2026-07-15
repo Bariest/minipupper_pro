@@ -184,6 +184,10 @@ static void cli_list_params(void){
         cli_printf("  %s\n", driver_board_param_name(p));
 }
 
+/* defined below (they need the NVS helpers) */
+static void offsets_reload(void);
+static void servo_board_set(int b);
+
 static void cli_exec(char *cmd){
     cli_out[0]=0;
     // echo (sanitised for the <pre> block)
@@ -205,7 +209,8 @@ static void cli_exec(char *cmd){
                    "  <id 1-12> stop               idle, motor off\n"
                    "  <id 1-12> fb                 present position + current\n"
                    "  dump              all 12 servos\n"
-                   "  trace <id>        live position/current view (trace off = stop)\n"
+                   "  trace <id> [hz]   live position/current + ESP timestamp (default 10Hz,\n"
+                   "                    up to 200Hz; e.g. 'trace 2 50'; 'trace off' to stop)\n"
                    "  sweep [id low high hold_ms cycles hz]  PID step test -> CSV\n"
                    "                    (serial only, needs 'cli on'; default: 2 100 200 800 3 50)\n"
                    "  swalk [secs hz vx id...]  Stanford-walk PID trace -> CSV\n"
@@ -217,6 +222,8 @@ static void cli_exec(char *cmd){
                    "  offsets           print all 12 servo calibration offsets (serial only)\n"
                    "  save [id]         save board config to flash\n"
                    "  restore [id]      factory defaults (RAM, then save)\n"
+                   "  board [1|2|3]     get/set servo board variant (runtime, saved to NVS;\n"
+                   "                    renumbers ids to match the connectors - walk unaffected)\n"
                    "note: pos uses RAW AT32 angle, 135 = centre, no direction flip\n");
         cli_list_params();
 
@@ -250,6 +257,17 @@ static void cli_exec(char *cmd){
                            "Other commands (pos/tor/set/...) keep working while\n"
                            "it runs. Stop with 'trace off'.\n", id);
             else cli_printf("usage: trace <id 1-12> | trace off\n");
+        }
+
+    }else if(!strcmp(t0,"board")){
+        char *t1 = strtok_r(NULL," \t",&sp);
+        if(t1){
+            int b = atoi(t1);
+            if(b<1 || b>3){ cli_printf("usage: board <1|2|3>\n"); return; }
+            servo_board_set(b);
+            cli_printf("servo board variant = %d (saved to NVS, ids renumbered, offsets reloaded)\n", b);
+        }else{
+            cli_printf("servo board variant = %d\n", g_servo_board);
         }
 
     }else if(!strcmp(t0,"restore") || !strcmp(t0,"factory_restore")){
@@ -329,17 +347,22 @@ static void cli_exec(char *cmd){
  * Runs as its own task; stdin is polled non-blocking (works on the UART
  * console and on USB-Serial-JTAG).                                        */
 static int TraceId = 0;                 /* 0 = off, 1-12 = servo being traced */
+static uint32_t TracePeriodMs = 100;    /* sample period; 100ms = 10Hz default */
 
 static void trace_print_line(int id){
     static const char *mn[] = {"IDLE","POS ","TOR ","IK  "};
+    /* ESP timestamp in ms (0.1 ms resolution) so you can compute speed/RPM
+     * by hand: RPM = (now2 - now1) deg / (t2 - t1) ms * 1000 / 6.            */
+    double t_ms = (double)esp_timer_get_time() / 1000.0;
     float lv[DB_LIVE_COUNT];
     bool ok = true;
     for(int i=0; i<DB_LIVE_COUNT && ok; i++)
         ok = driver_board_get_live(id, i, &lv[i]);
     if(ok){
         int m = (int)lv[DB_LIVE_MODE];
-        printf("pos s/n/e %6.1f/%6.1f/%5.1f deg | cur c/s/n/e %4.0f/%4.0f/%4.0f/%4.0f mA"
+        printf("t=%10.1f ms | pos s/n/e %6.1f/%6.1f/%5.1f deg | cur c/s/n/e %4.0f/%4.0f/%4.0f/%4.0f mA"
                " | duty %5.1f%% | adc %4.0f/%4.0f | %s | loop %lu\n",
+               t_ms,
                lv[DB_LIVE_SETPOINT_POS_DEG], lv[DB_LIVE_PRESENT_POS_DEG],
                lv[DB_LIVE_ERROR_POS_DEG],
                lv[DB_LIVE_MAX_CURRENT_MA], lv[DB_LIVE_SETPOINT_CUR_MA],
@@ -348,9 +371,9 @@ static void trace_print_line(int id){
                lv[DB_LIVE_POS_ADC], lv[DB_LIVE_CUR_ADC],
                (m>=0&&m<4)?mn[m]:"?", (unsigned long)lv[DB_LIVE_LOOP_COUNTER]);
     }else if(driver_board_poll(id)){
-        printf("pos %4u SCS  cur %5d mA  (basic - old AT32 fw)\n",
-               driver_board_present_position(id), driver_board_present_current(id));
-    }else printf("SPI poll failed\n");
+        printf("t=%10.1f ms | pos %4u SCS  cur %5d mA  (basic - old AT32 fw)\n",
+               t_ms, driver_board_present_position(id), driver_board_present_current(id));
+    }else printf("t=%10.1f ms | SPI poll failed\n", t_ms);
 }
 
 /* ---- automated step-response sweep for PID tuning (serial CLI) ----------
@@ -492,9 +515,10 @@ static void serial_handle_line(char *line){
         static const char *nm[13] = {"",
             "FR hip","FR thigh","FR calf",  "FL hip","FL thigh","FL calf",
             "RR hip","RR thigh","RR calf",  "RL hip","RL thigh","RL calf"};
-        printf("servo offsets (deg), added on top of the IK angle:\n");
+        printf("servo offsets (deg), added on top of the IK angle:\n"
+               "(id = connector number on board variant %d)\n", g_servo_board);
         for(int i=1;i<=12;i++)
-            printf("  id %2d  %-8s  %+.1f\n", i, nm[i], offset[i]);
+            printf("  id %2d  %-8s  %+.1f\n", i, nm[db_phys(i)], offset[i]);
         return;
     }
     if(!strcmp(line,"trace off")){
@@ -502,13 +526,22 @@ static void serial_handle_line(char *line){
         else printf("trace is not running\n");
         return;
     }
-    int tid;
-    if(sscanf(line,"trace %d",&tid)==1){
+    int tid, thz = 0;
+    int tn = sscanf(line,"trace %d %d",&tid,&thz);
+    if(tn >= 1){
         if(tid<1 || tid>12){ printf("bad servo id\n"); return; }
         if(!CliMode){ printf("run 'cli on' first (gait would fight the SPI bus)\n"); return; }
+        if(tn >= 2 && thz > 0){
+            if(thz > 200) thz = 200;              /* SPI/GET_LIVE caps it anyway */
+            TracePeriodMs = 1000u / (uint32_t)thz;
+            if(TracePeriodMs < 1) TracePeriodMs = 1;
+        }else{
+            TracePeriodMs = 100;                  /* default 10 Hz */
+        }
         TraceId = tid;
-        printf("TRACE ON servo %d at 10 Hz - commands still work while it runs.\n"
-               "stop with 'trace off' or press 'q' on an empty line\n", tid);
+        printf("TRACE ON servo %d at ~%lu Hz - commands still work while it runs.\n"
+               "stop with 'trace off' or press 'q' on an empty line\n",
+               tid, (unsigned long)(1000u / TracePeriodMs));
         return;
     }
     if(!CliMode && strcmp(line,"help")!=0)
@@ -530,13 +563,13 @@ static void console_task(void *arg){
         if(c == EOF){
             if(TraceId){
                 uint32_t now = millis();
-                if(now - last_trace_ms >= 100){   /* 10 Hz live stream */
+                if(now - last_trace_ms >= TracePeriodMs){   /* rate set by 'trace <id> [hz]' */
                     last_trace_ms = now;
                     trace_print_line(TraceId);
                     fflush(stdout);
                 }
             }
-            vTaskDelay(pdMS_TO_TICKS(20));
+            vTaskDelay(pdMS_TO_TICKS(TraceId ? 2 : 20));   /* poll fast while tracing */
             continue;
         }
         if(c=='q' && pos==0 && TraceId){          /* quick-stop the trace */
@@ -583,6 +616,27 @@ static void nvs_put_int(const char*k, int v){
     nvs_set_i32(nvs,k,v); nvs_commit(nvs);
 }
 
+/* Re-read the 12 calibration offsets for the CURRENT board variant.
+ * offset[] is indexed by user-facing CONNECTOR id, but stored in NVS under
+ * the electrical CHANNEL number ("offset<db_phys(id)>"), because a
+ * horn/centre error is a property of the physical servo. Offsets saved by
+ * the old firmware (implicitly board 1, id == channel) read unchanged. */
+static void offsets_reload(void){
+    for(int i=1;i<=12;i++){
+        char k[12]; snprintf(k,sizeof k,"offset%d",db_phys(i));
+        offset[i]=nvs_get_float(k,0);
+    }
+}
+
+/* Switch the board variant at runtime: renumbers the user-facing ids AND
+ * re-associates the saved offsets with the physical servos they belong to.
+ * The walk itself is unaffected (db_phys is applied twice and cancels). */
+static void servo_board_set(int b){
+    g_servo_board = b;
+    nvs_put_int("svboard", b);
+    offsets_reload();
+}
+
 static void servo_write(int ch, float ang){
     int sig = 511 + (int)(ang / 0.263f);
     if(sig<0) sig=0;
@@ -590,10 +644,16 @@ static void servo_write(int ch, float ang){
     goal[ch] = (uint16_t)sig;
 }
 
-/* The board-variant servo swap (SERVO_BOARD) now lives in driver_board.h and
- * is applied at the driver layer (db_phys), so it covers the walk, calibration,
- * the `pos` command, sweep/swalk and feedback consistently. The IK below just
- * uses plain logical servo ids 1..12. */
+/* ---- servo id scheme --------------------------------------------------
+ * User-facing servo ids (CLI pos/trace/get/set, calibration page, offsets,
+ * goal[]) are CONNECTOR NUMBERS of the selected board variant. The IK below
+ * was tuned with ROLE ids (1..3 = FR, 4..6 = FL, 7..9 = RR, 10..12 = RL,
+ * wired as on this robot), so each role id is passed through db_phys() ONCE
+ * here to get its connector number, and driver_board_sync_write() applies
+ * db_phys() a SECOND time to get the electrical channel. The maps are
+ * self-inverse, so the two applications cancel: every servo receives exactly
+ * the same command as the proven board-1 walk, for ANY board setting. Only
+ * the user-facing numbering changes with `board <n>`. */
 
 /* ---- neutral-angle calibration (like NEUTRAL_ANGLE_DEGREES in the BSP) --
  * On this robot the physical standing pose is ALL SERVOS CENTRED (the Ini
@@ -616,9 +676,10 @@ static void fRIK(float x,float th0,float z){
     float phi=atan2f(x,zd);
     float th1=phi-acosf((L1*L1+ld*ld-L2*L2)/(2*L1*ld));
     float th2=asinf((ld*ld-L1*L1-L2*L2)/(2*L1*L2))-th1;
-    servo_write(1,  th0                            + offset[1]);
-    servo_write(2, -((th1-th1_neutral)*180.0f/PI)  + offset[2]);
-    servo_write(3,  (th2-th2_neutral)*180.0f/PI    + offset[3]);
+    const int s1=db_phys(1), s2=db_phys(2), s3=db_phys(3);
+    servo_write(s1,  th0                            + offset[s1]);
+    servo_write(s2, -((th1-th1_neutral)*180.0f/PI)  + offset[s2]);
+    servo_write(s3,  (th2-th2_neutral)*180.0f/PI    + offset[s3]);
 }
 static void rRIK(float x,float th0,float z){
     float zd=z/cosf(th0/180.0f*PI);
@@ -626,9 +687,10 @@ static void rRIK(float x,float th0,float z){
     float phi=atan2f(x,zd);
     float th1=phi-acosf((L1*L1+ld*ld-L2*L2)/(2*L1*ld));
     float th2=asinf((ld*ld-L1*L1-L2*L2)/(2*L1*L2))-th1;
-    servo_write(7,  th0                            + offset[7]);
-    servo_write(8, -((th1-th1_neutral)*180.0f/PI)  + offset[8]);
-    servo_write(9,  (th2-th2_neutral)*180.0f/PI    + offset[9]);
+    const int s1=db_phys(7), s2=db_phys(8), s3=db_phys(9);
+    servo_write(s1,  th0                            + offset[s1]);
+    servo_write(s2, -((th1-th1_neutral)*180.0f/PI)  + offset[s2]);
+    servo_write(s3,  (th2-th2_neutral)*180.0f/PI    + offset[s3]);
 }
 static void fLIK(float x,float th0,float z){
     float zd=z/cosf(th0/180.0f*PI);
@@ -636,9 +698,10 @@ static void fLIK(float x,float th0,float z){
     float phi=atan2f(x,zd);
     float th1=phi-acosf((L1*L1+ld*ld-L2*L2)/(2*L1*ld));
     float th2=asinf((ld*ld-L1*L1-L2*L2)/(2*L1*L2))-th1;
-    servo_write(4,  th0                            + offset[4]);
-    servo_write(5,  (th1-th1_neutral)*180.0f/PI    + offset[5]);
-    servo_write(6, -((th2-th2_neutral)*180.0f/PI)  + offset[6]);
+    const int s1=db_phys(4), s2=db_phys(5), s3=db_phys(6);
+    servo_write(s1,  th0                            + offset[s1]);
+    servo_write(s2,  (th1-th1_neutral)*180.0f/PI    + offset[s2]);
+    servo_write(s3, -((th2-th2_neutral)*180.0f/PI)  + offset[s3]);
 }
 static void rLIK(float x,float th0,float z){
     float zd=z/cosf(th0/180.0f*PI);
@@ -646,9 +709,10 @@ static void rLIK(float x,float th0,float z){
     float phi=atan2f(x,zd);
     float th1=phi-acosf((L1*L1+ld*ld-L2*L2)/(2*L1*ld));
     float th2=asinf((ld*ld-L1*L1-L2*L2)/(2*L1*L2))-th1;
-    servo_write(10, th0                            + offset[10]);
-    servo_write(11, (th1-th1_neutral)*180.0f/PI    + offset[11]);
-    servo_write(12,-((th2-th2_neutral)*180.0f/PI)  + offset[12]);
+    const int s1=db_phys(10), s2=db_phys(11), s3=db_phys(12);
+    servo_write(s1,  th0                            + offset[s1]);
+    servo_write(s2,  (th1-th1_neutral)*180.0f/PI    + offset[s2]);
+    servo_write(s3, -((th2-th2_neutral)*180.0f/PI)  + offset[s3]);
 }
 
 /* ---- automated walk-tune: run the Stanford trot gait while streaming
@@ -864,7 +928,7 @@ static void run_sjump(const int *ids, int nids, int hz, int reps){
         /* 3) explosive push to full extension */
         servo_speed_all(0);
         fRIK(0,0,pushZ); fLIK(0,0,pushZ); rRIK(0,0,pushZ); rLIK(0,0,pushZ);
-        servo_flush(); servo_flush();
+        servo_flush(); //servo_flush();
         /* 4) airborne - hold the push, keep logging */
         int airMs = (int)(160.0f + (70.0f - crouchZ) * 1.0f);
         time_mSt = millis(); tim = 0;
@@ -1034,7 +1098,7 @@ static esp_err_t send_root(httpd_req_t *req){
         A("<div style=\"background:%s;padding:12px;border-radius:8px;min-width:172px;\">"
           "<strong>%s</strong>", legC[leg], legN[leg]);
         for(int j=0;j<3;j++){
-            int id = leg*3 + j + 1;
+            int id = db_phys(leg*3 + j + 1);  /* role -> connector id */
             A("<div style=\"margin-top:8px;\">%s<br>"
               "<a class=\"pm\" href=\"/cal%dM\">&minus;</a>"
               "<span style=\"width:64px;\">%.1f&deg;</span>"
@@ -1191,7 +1255,9 @@ static esp_err_t h_cal(httpd_req_t*r){
     char sign = r->uri[strlen(r->uri)-1];
     if(id>=1 && id<=12){
         offset[id] += (sign=='P') ? 1.0f : -1.0f;
-        char k[12]; snprintf(k,sizeof k,"offset%d",id);
+        /* keyed by electrical CHANNEL so the calibration stays with the
+         * physical servo across board-variant changes (see offsets_reload) */
+        char k[12]; snprintf(k,sizeof k,"offset%d",db_phys(id));
         nvs_put_float(k, offset[id]);
     }
     return send_root(r);
@@ -1729,7 +1795,10 @@ static void gait_task(void *arg){
                 fRIK( stride*sinf(tt),0,height);                   rLIK( stride*sinf(tt)+15,0,height);
                 rRIK(-stride*sinf(tt)+15,0,height-upHeight*cosf(tt)); fLIK(-stride*sinf(tt),0,height-upHeight*cosf(tt)); servo_flush(); }
 
-        }else if(Left){
+        /* L/R MIRROR: the code's leg roles are swapped left<->right vs the
+         * physical legs, so the Left flag runs the motion originally written
+         * as Right (and vice versa, same for TurnL/TurnR). Bodies untouched. */
+        }else if(Right){
             time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0, tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt)); rLIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt));
@@ -1745,7 +1814,7 @@ static void gait_task(void *arg){
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0,tilt*sinf(tt),height); rLIK(0,-tilt*sinf(tt),height); servo_flush(); }
 
-        }else if(Right){
+        }else if(Left){
             time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt)); rLIK(0,tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt));
@@ -1761,7 +1830,7 @@ static void gait_task(void *arg){
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0,-tilt*sinf(tt),height); rLIK(0,tilt*sinf(tt),height); servo_flush(); }
 
-        }else if(TurnL){
+        }else if(TurnR){
             time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0, tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt)); rLIK(0, tilt-2*tilt*sinf(tt),height-upHeight*sinf(tt));
@@ -1777,7 +1846,7 @@ static void gait_task(void *arg){
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0,tilt*sinf(tt),height); rLIK(0,tilt*sinf(tt),height); servo_flush(); }
 
-        }else if(TurnR){
+        }else if(TurnL){
             time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
                 fRIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt)); rLIK(0,-tilt+2*tilt*sinf(tt),height-upHeight*sinf(tt));
@@ -2031,6 +2100,11 @@ static void gait_task(void *arg){
             if(millis() - js_last_ms < JOY_TIMEOUT_MS){
                 vx = js_vx; vy = js_vy; wz = js_wz;
             }
+            /* L/R MIRROR: on this robot the code's leg roles are swapped
+             * left<->right vs the physical legs (invisible when walking
+             * straight, mirrored for strafe/turn). Flip the lateral and
+             * yaw commands so user left = robot left. */
+            vy = -vy; wz = -wz;
 
             sg_foot_t feet[4];
             stanford_gait_step(vx, vy, wz, SG_WALK_HEIGHT,
@@ -2055,7 +2129,7 @@ static void gait_task(void *arg){
             // position instead of the value the IK just computed.
             servo_speed_all(0);
             fRIK(0,0,height); rRIK(0,0,height); fLIK(0,0,height); rLIK(0,0,height);
-            goal[8] = manual8_pos;   // override just servo 8
+            goal[db_phys(8)] = manual8_pos;   // override just the RR shoulder (role 8)
             servo_flush();
             vTaskDelay(1);
 
@@ -2091,11 +2165,12 @@ void app_main(void){
     vTaskDelay(pdMS_TO_TICKS(1000));     // let servo power rails settle
 
     int32_t v;
+    if(nvs_get_i32(nvs,"svboard",&v)==ESP_OK && v>=1 && v<=3) g_servo_board=(int)v;
     if(nvs_get_i32(nvs,"period",&v)==ESP_OK) period=v;
     if(nvs_get_i32(nvs,"height",&v)==ESP_OK) height=v;
     if(nvs_get_i32(nvs,"sgspeed",&v)==ESP_OK) sgspeed=v;
-    for(int i=1;i<=12;i++){ char k[12]; snprintf(k,sizeof k,"offset%d",i);
-        offset[i]=nvs_get_float(k, offset[i]); }
+    offsets_reload();   /* must run AFTER svboard is known (keys are physical) */
+    ESP_LOGI(TAG, "servo board variant %d", g_servo_board);
 
     wifi_init_sta();
     start_webserver();
