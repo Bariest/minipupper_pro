@@ -128,7 +128,7 @@ void driver_board_sync_write(const uint16_t pos[12], const uint16_t cur_mA[12])
         servo_cmd_sub_t *sub[3] = { &frame.s1, &frame.s2, &frame.s3 };
         for (int j = 0; j < 3; j++) {
             int idx = b + j;                     /* PHYSICAL channel index */
-            int L   = db_phys(idx + 1) - 1;      /* LOGICAL servo feeding it */
+            int L   = db_phys_inv(idx + 1) - 1;      /* LOGICAL servo feeding this physical chan */
             sub[j]->mode = MODE_POSITION;
             /* SCS 0..1023 -> AT32 deci-degrees 0..2700, with the same global
              * direction flip the reference uses. Position already carries the

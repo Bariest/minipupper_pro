@@ -26,6 +26,11 @@
  * stanford_kinematics.c). Every OTHER mode keeps the legacy planar
  * fRIK/fLIK/rRIK/rLIK. Nothing to toggle. */
 #include "mqtt_client.h"
+#include "mp2_calib.h"           // BF_STAND[]/BF_SIGN[] -- shared servo calibration
+#include "mp2_backflip_data.h"   // optimized backflip keyframes (auto-generated)
+#include "mp2_backflip2_data.h"  // hand-crafted backflip keyframes (backflip_edit.py)
+#include "mp2_caltest_data.h"    // calibration test: lift one leg at a time
+#include "hardcode_backflip_angle.h" // "Backflip 3": hand-taught SCS keyframes
 
 #define TAG "PUPPER"
 #define PI 3.14159265358979f
@@ -62,6 +67,7 @@ static float L1 = 50, L2 = 56;
 static int Ini=0, Step=0, Roll=0, Pitch=0, Stretch=0;
 static int Advance=0, Back=0, Left=0, Right=0, TurnL=0, TurnR=0;
 static int Twerk=0, Jump=0, JumpFwd=0, TestSpeed=0, Mate=0, Stanford=0;
+static int Backflip=0;   // optimized backflip playback (bench demo, see gait loop)
 static int sg_started=0;   // Stanford gait state initialised for this activation
 
 // CLI mode: pauses the gait loop so the HTTP task has exclusive SPI access
@@ -98,10 +104,44 @@ static int sgspeed=100;   // Stanford walk speed, mm/s (max 200 = reference full
 static uint16_t goal[13];
 static uint16_t goal_speed[13];   // legacy "speed" units; converted to mA on flush
 
-// Manual override for servo 8 (Rear Right shoulder). When manual8 is set the
-// gait task holds a neutral stand but drives servo 8 to manual8_pos.
-static int manual8 = 0;
-static uint16_t manual8_pos = 511;   // SCS position 0..1023 (511 = centre)
+// Manual override for any servo. When manual_ovr[id] is set, the gait task
+// holds a neutral stand but drives that servo to manual_ovr_deg[id] degrees.
+// Indexed 1..12 (1-indexed, like goal[]).
+static int       manual_ovr[13] = {0};      // non-zero = override active
+static float     manual_ovr_deg[13] = {0};  // angle in degrees (0-270)
+
+/* ---- teach / record / playback (hand-pose keyframes) ------------------
+ * Teach mode relaxes the legs to a LOW-TORQUE follow so you can pose them by
+ * hand; Record snapshots all 12 present angles into a keyframe; Verify steps
+ * to one keyframe at low speed / normal torque so you can confirm it before
+ * committing; Play runs the whole trace ONCE from the initial (Ini) pose.
+ * Mirror is the optional optimizer: copy the RIGHT legs onto the LEFT (same
+ * foot height, mirrored joint angles). The trace can be saved to flash (NVS)
+ * so the recorded angles survive a reboot ("hardcoded"). */
+#define MAX_FRAMES   32
+static int teach_cur = 50;       /* teach-mode current cap (mA); lower = limper */
+static uint16_t rec_frames[MAX_FRAMES][13];  /* [frame][servo 1..12] SCS 0..1023 */
+static int rec_count   = 0;      /* number of recorded keyframes                */
+static int Relax       = 0;      /* teach (hand-pose) mode                      */
+static int Play        = 0;      /* play the whole trace once                   */
+static int Goto        = 0;      /* move to one keyframe (verify)               */
+static int goto_frame  = 0;      /* which keyframe Goto targets                 */
+static int verify_idx  = 0;      /* Verify Prev/Next cursor                     */
+static int HoldPose    = 0;      /* hold a fixed pose after play/verify         */
+static uint16_t hold_frame[13];  /* the pose HoldPose holds                     */
+static int GotoPose    = 0;      /* move to a typed-in SCS pose ('pose' cmd)    */
+static uint16_t pose_target[13]; /* the 12 SCS values to move to                */
+static volatile int rec_request = 0;      /* /rec sets this; the gait task captures (volatile: cross-core flag) */
+static int play_ms     = 1000;   /* move time per pose (ms); low speed default  */
+static int play_delay_ms = 0;    /* dwell/hold at each pose after the move (ms)  */
+/* Optional PER-FRAME timing (used by Backflip 3). When use_frame_timing==1 the
+ * Play loop uses frame_move_ms[f]/frame_delay_ms[f] instead of the globals
+ * above, so every transition can have its own speed and pause. Taught traces
+ * leave this 0 and keep using the global play_ms/play_delay_ms. */
+static int frame_move_ms[MAX_FRAMES];    /* per-frame move time (ms)            */
+static int frame_delay_ms[MAX_FRAMES];   /* per-frame dwell time (ms)           */
+static int use_frame_timing = 0; /* 1 = use the per-frame arrays above          */
+static uint16_t cur_override_mA = 0;  /* 0 = normal cap; else force this cap    */
 
 static inline void servo_speed(int ch, uint16_t spd){
     goal_speed[ch] = spd;
@@ -120,7 +160,10 @@ static void servo_flush(void){
     uint16_t pos[12], cur[12];
     for(int i=0; i<12; i++){
         pos[i] = goal[i+1];
-        cur[i] = speed_to_current_mA(goal_speed[i+1]);  // speed -> current limit (mA)
+        // teach/hold modes force a fixed current cap via cur_override_mA;
+        // otherwise use the legacy speed->current mapping (full torque).
+        cur[i] = cur_override_mA ? cur_override_mA
+                                 : speed_to_current_mA(goal_speed[i+1]);
     }
     driver_board_sync_write(pos, cur);
 }
@@ -130,8 +173,11 @@ static inline uint32_t millis(void){ return (uint32_t)(esp_timer_get_time()/1000
 static void reset_all_modes(void){
     Ini=Step=Roll=Pitch=Stretch=0;
     Advance=Back=Left=Right=TurnL=TurnR=Twerk=Jump=JumpFwd=TestSpeed=Mate=Stanford=0; // <-- add TestSpeed here
-    manual8=0;
+    Backflip=0;
+    for(int i=1;i<=12;i++) manual_ovr[i]=0;
     sg_started=0;
+    Relax=Play=Goto=HoldPose=GotoPose=0;   // stop teach / playback modes too
+    cur_override_mA=0;            // back to normal torque cap
 }
 
 // Toggle a motion flag the same way the web buttons do: pressing the
@@ -413,6 +459,10 @@ static void run_sweep(int id, float low, float high,
  * while streaming per-servo tracking CSV so you can PID-tune during the walk */
 static void run_swalk(const int *ids, int nids, int secs, int hz, float vx);
 
+/* teach/playback optimizer: mirror the recorded RIGHT legs onto the LEFT.
+ * Defined after the IK helpers; forward-declared here for the serial CLI. */
+static void mirror_RL(void);
+
 /* likewise: runs the all-leg Stretch bob (up/down) while streaming per-servo
  * tracking CSV, so you can PID-tune the vertical stretch motion. */
 static void run_sstretch(const int *ids, int nids, int secs, int hz);
@@ -420,6 +470,8 @@ static void run_sstretch(const int *ids, int nids, int secs, int hz);
 /* likewise: runs the in-place Jump (crouch/push/tuck/land) `reps` times while
  * streaming per-servo tracking CSV, so you can PID-tune the jump. */
 static void run_sjump(const int *ids, int nids, int hz, int reps);
+
+static void nvs_put_float(const char*k, float v);   /* fwd: used by setcal/calhere */
 
 static void serial_handle_line(char *line){
     if(!strncmp(line,"sweep",5)){
@@ -476,6 +528,234 @@ static void serial_handle_line(char *line){
         }
         if(nids==0){ ids[0]=2; ids[1]=3; nids=2; }
         run_sjump(ids, nids, hz, reps);
+        return;
+    }
+    // ---- teach / record / playback (serial equivalents of the web UI) ----
+    if(!strcmp(line,"teach")){
+        started_once=1;
+        if(Relax){ Relax=0; reset_all_modes(); printf("teach OFF (back to stand)\n"); }
+        else     { reset_all_modes(); Relax=1;  printf("teach ON - pose the legs by hand, then 'rec'\n"); }
+        return;
+    }
+    if(!strcmp(line,"rec")){
+        if(!Relax) printf("run 'teach' first\n");
+        else if(rec_count>=MAX_FRAMES) printf("trace full (%d frames)\n", MAX_FRAMES);
+        else { rec_request=1; printf("recording frame %d\n", rec_count+1); }
+        return;
+    }
+    if(!strcmp(line,"recclear")){ rec_count=0; verify_idx=0; use_frame_timing=0; printf("trace cleared\n"); return; }
+    if(!strcmp(line,"recdel")){ if(rec_count>0) rec_count--; printf("%d frames left\n", rec_count); return; }
+    if(!strcmp(line,"recdump")){
+        /* Dump the taught keyframes as CSV (SCS 0..1023) so a PC can replay them
+         * in Isaac. Capture with: python -m serial.tools.miniterm ... or your logger. */
+        printf("kf,s1,s2,s3,s4,s5,s6,s7,s8,s9,s10,s11,s12\n");
+        for(int f=0; f<rec_count; f++){
+            printf("%d", f);
+            for(int i=1;i<=12;i++) printf(",%u", rec_frames[f][i]);
+            printf("\n");
+        }
+        printf("(%d frames)\n", rec_count);
+        return;
+    }
+    // Set the STAND CALIBRATION from a recdump neutral row: 12 SCS values.
+    //   setcal 57,634,649,50,400,551,50,589,534,50,486,495
+    // Stores offset[id] = (scs-511)*0.263 for all 12 servos and saves to NVS,
+    // so every motion (walk, backflip, cal-test) sits on this exact stance.
+    if(!strncmp(line,"setcal",6) && (line[6]==' ' || line[6]==',' || line[6]=='\t')){
+        char tmp[160]; strncpy(tmp,line+7,sizeof tmp-1); tmp[sizeof tmp-1]=0;
+        int v[13]; int n=0; char *sp3=NULL;
+        for(char *tk=strtok_r(tmp," ,\t",&sp3); tk && n<12; tk=strtok_r(NULL," ,\t",&sp3)){
+            int s=atoi(tk);
+            if(s<0) s=0;
+            if(s>1023) s=1023;
+            v[++n]=s;
+        }
+        if(n!=12){ printf("setcal: need 12 SCS values (got %d)\n", n); return; }
+        printf("setcal: stand calibration from neutral row ->\n");
+        for(int i=1;i<=12;i++){
+            offset[i] = (v[i] - 511) * 0.263f;
+            char k[12]; snprintf(k,sizeof k,"offset%d",i);
+            nvs_put_float(k, offset[i]);
+            printf("  id %2d  scs %4d  offset %+7.2f\n", i, v[i], offset[i]);
+        }
+        printf("saved to NVS. Press Ini (or reboot) to stand on the new calibration.\n");
+        return;
+    }
+    // Capture the CURRENT servo positions as the stand calibration. Pose the
+    // robot in its normal stance first (e.g. via teach), then run 'calhere'.
+    if(!strcmp(line,"calhere")){
+        printf("calhere: capturing present positions as the stand ->\n");
+        for(int i=1;i<=12;i++){
+            int scs = (int)driver_board_present_position(i);
+            offset[i] = (scs - 511) * 0.263f;
+            char k[12]; snprintf(k,sizeof k,"offset%d",i);
+            nvs_put_float(k, offset[i]);
+            printf("  id %2d  scs %4d  offset %+7.2f\n", i, scs, offset[i]);
+        }
+        printf("saved to NVS.\n");
+        return;
+    }
+    // Move to a single pose typed straight from a recdump line: 12 SCS values
+    // (0..1023), comma OR space separated. e.g.
+    //   pose 56,184,528,50,851,560,49,632,509,48,408,552
+    // The robot eases into that pose at the current play speed and holds it.
+    if(!strncmp(line,"pose",4) && (line[4]==' ' || line[4]==',' || line[4]=='\t')){
+        char tmp[160]; strncpy(tmp,line+5,sizeof tmp-1); tmp[sizeof tmp-1]=0;
+        int v[13]; int n=0; char *sp2=NULL;
+        for(char *tk=strtok_r(tmp," ,\t",&sp2); tk && n<12; tk=strtok_r(NULL," ,\t",&sp2)){
+            int s=atoi(tk); if(s<0)s=0; if(s>1023)s=1023; v[++n]=s;
+        }
+        if(n!=12){ printf("pose: need 12 SCS values (got %d)\n", n); return; }
+        reset_all_modes();
+        for(int i=1;i<=12;i++) pose_target[i]=(uint16_t)v[i];
+        started_once=1; GotoPose=1;
+        printf("pose: moving to %d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+               v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11],v[12]);
+        return;
+    }
+    if(!strcmp(line,"mirror")){ mirror_RL(); printf("mirrored R->L on %d frames\n", rec_count); return; }
+    if(!strcmp(line,"play")){
+        if(rec_count>0){ reset_all_modes(); started_once=1; Play=1; printf("playing %d frames\n", rec_count); }
+        else printf("no frames recorded\n");
+        return;
+    }
+    int vf;
+    if(sscanf(line,"verify %d",&vf)==1){
+        if(rec_count<=0){ printf("no frames\n"); return; }
+        if(vf<0) vf=0;
+        if(vf>=rec_count) vf=rec_count-1;
+        verify_idx=vf; reset_all_modes(); started_once=1; goto_frame=vf; Goto=1;
+        printf("verify frame %d\n", vf);
+        return;
+    }
+    // ---- backflip frame inspection: load the 28 optimized poses into the trace
+    // buffer as SCS, then use Verify </> / 'verify N' / 'play' to step them one
+    // by one. Same math the backflip playback uses (BF_SIGN/BF_STAND + offset).
+    if(!strcmp(line,"bfload")){
+        reset_all_modes();
+        int nf = BF_FRAMES < MAX_FRAMES ? BF_FRAMES : MAX_FRAMES;
+        for(int f=0; f<nf; f++){
+            for(int id=1; id<=12; id++){
+                float ang = BF_SIGN[id-1]*(BF_URDF_DEG[f][id-1] - BF_STAND[id-1]) + offset[id];
+                int sig = 511 + (int)(ang / 0.263f);
+                if(sig<0) sig=0;
+                if(sig>1023) sig=1023;
+                rec_frames[f][id] = (uint16_t)sig;
+            }
+        }
+        rec_count = nf; verify_idx = 0; use_frame_timing = 0;
+        printf("bfload: %d backflip frames -> trace. Use Verify </>, 'verify N', or 'play'.\n", nf);
+        return;
+    }
+    int bff;
+    if(sscanf(line,"bfgoto %d",&bff)==1){
+        // (re)load the backflip poses, then hold at frame bff for inspection.
+        int nf = BF_FRAMES < MAX_FRAMES ? BF_FRAMES : MAX_FRAMES;
+        for(int f=0; f<nf; f++)
+            for(int id=1; id<=12; id++){
+                float ang = BF_SIGN[id-1]*(BF_URDF_DEG[f][id-1] - BF_STAND[id-1]) + offset[id];
+                int sig = 511 + (int)(ang / 0.263f);
+                if(sig<0) sig=0;
+                if(sig>1023) sig=1023;
+                rec_frames[f][id] = (uint16_t)sig;
+            }
+        rec_count = nf;
+        if(bff<0) bff=0;
+        if(bff>=nf) bff=nf-1;
+        verify_idx=bff; reset_all_modes(); started_once=1; goto_frame=bff; Goto=1;
+        printf("bfgoto: holding backflip frame %d / %d\n", bff, nf);
+        return;
+    }
+    // ---- backflip #2 (hand-crafted, fewer frames) -> trace for Verify / play.
+    if(!strcmp(line,"bfload2")){
+        reset_all_modes();
+        int nf = BF2_FRAMES < MAX_FRAMES ? BF2_FRAMES : MAX_FRAMES;
+        for(int f=0; f<nf; f++){
+            for(int id=1; id<=12; id++){
+                float ang = BF_SIGN[id-1]*(BF2_URDF_DEG[f][id-1] - BF_STAND[id-1]) + offset[id];
+                int sig = 511 + (int)(ang / 0.263f);
+                if(sig<0) sig=0;
+                if(sig>1023) sig=1023;
+                rec_frames[f][id] = (uint16_t)sig;
+            }
+        }
+        rec_count = nf; verify_idx = 0; use_frame_timing = 0;
+        printf("bfload2: %d hand-crafted frames -> trace. Use Verify </>, 'verify N', or 'play'.\n", nf);
+        return;
+    }
+    // ---- CALIBRATION TEST: lift one leg at a time -> trace for Verify / play.
+    if(!strcmp(line,"caltest")){
+        reset_all_modes();
+        int nf = CAL_FRAMES < MAX_FRAMES ? CAL_FRAMES : MAX_FRAMES;
+        for(int f=0; f<nf; f++){
+            for(int id=1; id<=12; id++){
+                float ang = BF_SIGN[id-1]*(CAL_URDF_DEG[f][id-1] - BF_STAND[id-1]) + offset[id];
+                int sig = 511 + (int)(ang / 0.263f);
+                if(sig<0) sig=0;
+                if(sig>1023) sig=1023;
+                rec_frames[f][id] = (uint16_t)sig;
+            }
+        }
+        rec_count = nf; verify_idx = 0; use_frame_timing = 0;
+        printf("caltest: %d frames -> trace (lifts FL,FR,BL,BR one at a time). "
+               "Use Verify </> or 'play'.\n", nf);
+        return;
+    }
+    // ---- "Backflip 3": hand-taught SCS keyframes (hardcode_backflip_angle.h).
+    // Values are already raw command SCS, so copy them straight in (no remap).
+    if(!strcmp(line,"bfload3")){
+        reset_all_modes();
+        int nf = BF3_FRAMES < MAX_FRAMES ? BF3_FRAMES : MAX_FRAMES;
+        for(int f=0; f<nf; f++){
+            for(int id=1; id<=12; id++)
+                rec_frames[f][id] = BF3_SCS[f][id];
+            frame_move_ms[f]  = BF3_MOVE_MS[f];   // per-frame speed
+            frame_delay_ms[f] = BF3_DELAY_MS[f];  // per-frame dwell
+        }
+        rec_count = nf; verify_idx = 0; use_frame_timing = 1;
+        printf("bfload3: %d backflip-3 frames -> trace (per-frame timing). "
+               "Use Verify </>, 'verify N', or 'play'.\n", nf);
+        return;
+    }
+    // One-shot: load Backflip 3 and play it immediately using its own
+    // per-frame move times and delays (from hardcode_backflip_angle.h).
+    if(!strcmp(line,"bf3")){
+        reset_all_modes();
+        int nf = BF3_FRAMES < MAX_FRAMES ? BF3_FRAMES : MAX_FRAMES;
+        for(int f=0; f<nf; f++){
+            for(int id=1; id<=12; id++)
+                rec_frames[f][id] = BF3_SCS[f][id];
+            frame_move_ms[f]  = BF3_MOVE_MS[f];
+            frame_delay_ms[f] = BF3_DELAY_MS[f];
+        }
+        rec_count = nf; verify_idx = 0; use_frame_timing = 1;
+        started_once=1; Play=1;
+        printf("backflip 3: playing %d frames with per-frame timing\n", nf);
+        return;
+    }
+    int psp;
+    if(sscanf(line,"pspeed %d",&psp)==1){
+        if(psp<100)  psp=100;
+        if(psp>3000) psp=3000;
+        play_ms=psp;
+        nvs_set_i32(nvs,"play_ms",play_ms); nvs_commit(nvs);
+        printf("play speed = %d ms/pose (lower = faster)\n", play_ms);
+        return;
+    }
+    int pdl;
+    if(sscanf(line,"pdelay %d",&pdl)==1){
+        if(pdl<0)    pdl=0;
+        if(pdl>5000) pdl=5000;
+        play_delay_ms=pdl;
+        nvs_set_i32(nvs,"play_dly",play_delay_ms); nvs_commit(nvs);
+        printf("play delay = %d ms/pose (dwell/hold at each pose)\n", play_delay_ms);
+        return;
+    }
+    if(!strcmp(line,"recsave")){
+        nvs_set_i32(nvs,"rec_cnt",rec_count);
+        nvs_set_blob(nvs,"rec_fr",rec_frames,sizeof rec_frames);
+        nvs_commit(nvs);
+        printf("saved %d frames to flash\n", rec_count);
         return;
     }
     if(!strcmp(line,"cli on")){
@@ -567,6 +847,7 @@ static const motion_cmd_t motion_cmds[] = {
     {"turnl",     &TurnL},    {"turnr",     &TurnR},    {"twerk",  &Twerk},
     {"jump",      &Jump},     {"jumpfwd",   &JumpFwd},  {"testspeed",&TestSpeed},
     {"mate",      &Mate},     {"stanford",  &Stanford},
+    {"backflip",  &Backflip},
 };
 #define MOTION_CMD_COUNT (sizeof(motion_cmds)/sizeof(motion_cmds[0]))
 #endif /* ENABLE_MQTT */
@@ -590,6 +871,76 @@ static void servo_write(int ch, float ang){
     goal[ch] = (uint16_t)sig;
 }
 
+/* ---- teach / record / playback helpers -------------------------------- */
+
+/* Fill a keyframe with the INITIAL (Ini) pose: every servo centred + its
+ * calibration offset - the same pose the Ini button and power-on hold use.
+ * Playback starts here so "all start from initial position". */
+static void fill_ini_frame(uint16_t fr[13]){
+    for(int i=1;i<=12;i++){
+        int sig = 511 + (int)(offset[i]/0.263f);
+        if(sig<0) sig=0;
+        if(sig>1023) sig=1023;
+        fr[i]=(uint16_t)sig;
+    }
+}
+
+/* Smoothstep-interpolate goal[] from its current value to target[] over
+ * move_ms milliseconds, flushing continuously at NORMAL torque. Aborts early
+ * if *active is cleared (e.g. the user pressed another button). This is what
+ * gives the adjustable, low "speed" - the servos themselves run position
+ * control, so we pace the setpoint by hand. */
+static void interp_to(const uint16_t target[13], int move_ms, volatile int *active){
+    if(move_ms < 1) move_ms = 1;
+    uint16_t start[13];
+    for(int i=1;i<=12;i++) start[i]=goal[i];
+    uint32_t t0=millis(), tim;
+    while((tim=millis()-t0) < (uint32_t)move_ms){
+        if(active && !*active) break;
+        float f = (float)tim/(float)move_ms;       /* 0..1 */
+        float s = f*f*(3.0f-2.0f*f);               /* smoothstep ease in/out */
+        for(int i=1;i<=12;i++)
+            goal[i]=(uint16_t)((int)start[i] +
+                    (int)(((int)target[i]-(int)start[i])*s));
+        servo_flush();
+    }
+    for(int i=1;i<=12;i++) goal[i]=target[i];
+    servo_flush();
+}
+
+/* Hold goal[] steady (NORMAL torque) for ms milliseconds, flushing so the
+ * servos keep their setpoint. Aborts early if *active is cleared. Used to
+ * dwell at each pose during playback (the tunable "delay"). */
+static void dwell_ms(int ms, volatile int *active){
+    if(ms <= 0) return;
+    uint32_t t0=millis();
+    while((int)(millis()-t0) < ms){
+        if(active && !*active) break;
+        servo_flush();
+        vTaskDelay(1);
+    }
+}
+
+/* OPTIMIZER: mirror the RIGHT legs onto the LEFT in every recorded frame, so
+ * you only have to hand-pose one side and both feet end up at the same
+ * height. FR(1,2,3)->FL(4,5,6), RR(7,8,9)->RL(10,11,12). The hip copies
+ * straight across; the thigh and calf FLIP about the servo centre
+ * (1022 - scs), matching the fRIK/fLIK sign convention (left thigh = -right
+ * thigh, left calf = -right calf). So the joint ANGLES differ but the foot
+ * heights match - exactly the "not the same angle but the height is okay"
+ * behaviour. */
+static void mirror_RL(void){
+    for(int f=0; f<rec_count; f++){
+        uint16_t *F = rec_frames[f];
+        int t5 =1022-(int)F[2], t6 =1022-(int)F[3];
+        int t11=1022-(int)F[8], t12=1022-(int)F[9];
+        #define CLMP(x) ((x)<0?0:((x)>1023?1023:(x)))
+        F[4] =F[1];               F[5] =(uint16_t)CLMP(t5);  F[6] =(uint16_t)CLMP(t6);
+        F[10]=F[7];               F[11]=(uint16_t)CLMP(t11); F[12]=(uint16_t)CLMP(t12);
+        #undef CLMP
+    }
+}
+
 /* The board-variant servo swap (SERVO_BOARD) now lives in driver_board.h and
  * is applied at the driver layer (db_phys), so it covers the walk, calibration,
  * the `pos` command, sweep/swalk and feedback consistently. The IK below just
@@ -610,7 +961,15 @@ static void ik_neutral_init(void){
     th1_neutral = -acosf((L1*L1+ld*ld-L2*L2)/(2*L1*ld));
     th2_neutral = asinf((ld*ld-L1*L1-L2*L2)/(2*L1*L2)) - th1_neutral;
 }
+/* Stride direction. After the servo cables were re-seated the legs swing the
+ * opposite way, so "Advance" walked backwards. Negating x at the IK boundary
+ * flips forward/backward for EVERY caller (walk, teleop, turns, stanford gait)
+ * in one place, and does NOT touch the stance geometry -- the robot stands
+ * exactly as before. Set to +1.0f to restore the original direction. */
+#define IK_X_DIR (+1.0f)
+
 static void fRIK(float x,float th0,float z){
+    x *= IK_X_DIR;
     float zd=z/cosf(th0/180.0f*PI);
     float ld=sqrtf(x*x+zd*zd);
     float phi=atan2f(x,zd);
@@ -621,6 +980,7 @@ static void fRIK(float x,float th0,float z){
     servo_write(3,  (th2-th2_neutral)*180.0f/PI    + offset[3]);
 }
 static void rRIK(float x,float th0,float z){
+    x *= IK_X_DIR;
     float zd=z/cosf(th0/180.0f*PI);
     float ld=sqrtf(x*x+zd*zd);
     float phi=atan2f(x,zd);
@@ -631,6 +991,7 @@ static void rRIK(float x,float th0,float z){
     servo_write(9,  (th2-th2_neutral)*180.0f/PI    + offset[9]);
 }
 static void fLIK(float x,float th0,float z){
+    x *= IK_X_DIR;
     float zd=z/cosf(th0/180.0f*PI);
     float ld=sqrtf(x*x+zd*zd);
     float phi=atan2f(x,zd);
@@ -641,6 +1002,7 @@ static void fLIK(float x,float th0,float z){
     servo_write(6, -((th2-th2_neutral)*180.0f/PI)  + offset[6]);
 }
 static void rLIK(float x,float th0,float z){
+    x *= IK_X_DIR;
     float zd=z/cosf(th0/180.0f*PI);
     float ld=sqrtf(x*x+zd*zd);
     float phi=atan2f(x,zd);
@@ -951,6 +1313,9 @@ static esp_err_t send_root(httpd_req_t *req){
       "style=\"background:#27ae60;\"><a href=\"/jumpfwd\" style=\"color:white;\">&#8599; Jump Fwd</a>"
       "</button></div>", ON(JumpFwd));
     A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
+      "style=\"background:#8e44ad;\"><a href=\"/backflip\" style=\"color:white;\">&#128260; Backflip</a>"
+      "</button></div>", ON(Backflip));
+    A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
       "style=\"background:#2980b9;\"><a href=\"/testspeed\" style=\"color:white;\">&#9881; Test Speed</a>"
       "</button></div>", ON(TestSpeed));
     A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
@@ -1003,12 +1368,20 @@ static esp_err_t send_root(httpd_req_t *req){
           "font-size:0.72rem;white-space:pre-wrap;word-wrap:break-word;\">%s</pre>"
           "</div>", cli_out);
     }
-    A("<div style=\"margin:8px auto;\"><form action=\"/leg8\" method=\"get\" "
-      "style=\"display:inline;\">Leg 8 pos (0-1023): "
-      "<input type=\"number\" name=\"v\" value=\"%d\" min=\"0\" max=\"1023\" "
-      "style=\"width:80px;height:34px;\"><button type=\"submit\" "
-      "style=\"width:110px;background:%s;color:white;\">Set Leg 8</button>"
-      "</form></div>", manual8_pos, manual8?"lime":"#555");
+    // Find which servo is currently overridden (if any)
+    int active_id = 0;
+    float active_deg = 135;
+    for(int j=1;j<=12;j++){ if(manual_ovr[j]){ active_id=j; active_deg=manual_ovr_deg[j]; break; } }
+    A("<div style=\"margin:8px auto;\">"
+      "<form action=\"/leg\" method=\"get\" style=\"display:inline-flex;gap:6px;align-items:center;\">"
+      "Servo <select name=\"id\" style=\"width:56px;height:34px;\">");
+    for(int i=1;i<=12;i++)
+        A("<option value=\"%d\"%s>%d</option>", i, (active_id==i)?" selected":"", i);
+    A("</select>"
+      "Angle <input type=\"number\" name=\"deg\" value=\"%.0f\" min=\"0\" max=\"270\" "
+      "style=\"width:64px;height:34px;\">&deg;"
+      "<button type=\"submit\" style=\"width:70px;background:%s;color:white;\">Set</button>"
+      "</form></div>", active_deg, active_id?"lime":"#555");
     A("period (msec)<br><a class=\"pm\" href=\"/periodM\">-</a><span>%d</span>"
       "<a class=\"pm\" href=\"/periodP\">+</a><br>", period);
     A("height (mm)<br><a class=\"pm\" href=\"/heightM\">-</a><span>%d</span>"
@@ -1021,6 +1394,63 @@ static esp_err_t send_root(httpd_req_t *req){
       "<a class=\"pm\" href=\"/tiltP\">+</a><br>", tilt);
     A("stanford speed (mm/s)<br><a class=\"pm\" href=\"/sgsM\">-</a><span>%d</span>"
       "<a class=\"pm\" href=\"/sgsP\">+</a><br>", sgspeed);
+
+    // ---- Teach & Record (hand-pose keyframes) --------------------------
+    A("<hr><h3>&#128064; Teach &amp; Record</h3>"
+      "<p style=\"font-size:0.85rem;color:#666;\">"
+      "1) <b>Teach</b> relaxes the legs - pose them by hand.<br>"
+      "2) <b>Record</b> each pose you want.<br>"
+      "3) <b>Verify</b> steps through poses (low speed, normal torque).<br>"
+      "4) <b>Play</b> runs the whole trace once. <b>Save</b> keeps it after power-off.</p>");
+    A("<div style=\"margin:6px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
+      "style=\"background:#d35400;\"><a href=\"/relax\" style=\"color:white;\">"
+      "&#9995; Teach %s</a></button></div>", ON(Relax), Relax?"(ON)":"");
+    A("teach torque (mA) - lower = limper<br>"
+      "<a class=\"pm\" href=\"/tcurM\">-</a><span>%d</span>"
+      "<a class=\"pm\" href=\"/tcurP\">+</a><br>", teach_cur);
+    A("<div class=\"column-3\" style=\"max-width:340px;\">"
+      "<button type=\"button\" style=\"background:#2980b9;color:white;\">"
+      "<a href=\"/rec\" style=\"color:white;\">&#128308; Record</a></button>"
+      "<button type=\"button\"><a href=\"/recdel\">Del last</a></button>"
+      "<button type=\"button\" style=\"background:#c0392b;color:white;\">"
+      "<a href=\"/recclear\" style=\"color:white;\">Clear</a></button></div>");
+    A("<p style=\"font-size:1rem;\">Frames recorded: <strong>%d</strong> / %d</p>",
+      rec_count, MAX_FRAMES);
+    // Load the optimized backflip poses into the trace so Verify </> steps them.
+    A("<div style=\"margin:6px auto;\">"
+      "<button type=\"button\" style=\"background:#16a085;color:white;width:210px;\">"
+      "<a href=\"/bfload\" style=\"color:white;\">&#128260; Load backflip frames</a></button></div>");
+    A("<div style=\"margin:6px auto;\">"
+      "<button type=\"button\" style=\"background:#1abc9c;color:white;width:210px;\">"
+      "<a href=\"/bfload2\" style=\"color:white;\">&#128260; Load backflip frames 2</a></button></div>");
+    // Backflip 3: load (uses its own per-frame timing), plus a one-tap play.
+    A("<div style=\"margin:6px auto;\">"
+      "<button type=\"button\" style=\"background:#16a085;color:white;width:150px;\">"
+      "<a href=\"/bfload3\" style=\"color:white;\">&#128260; Load backflip 3</a></button>"
+      "<button class=\"twerk-btn %s\" type=\"button\" style=\"background:#27ae60;width:150px;\">"
+      "<a href=\"/bf3\" style=\"color:white;\">&#9654; Play backflip 3</a></button></div>", ON(Play));
+    // Calibration test: lift one leg at a time (FL, FR, BL, BR).
+    A("<div style=\"margin:6px auto;\">"
+      "<button type=\"button\" style=\"background:#e67e22;color:white;width:210px;\">"
+      "<a href=\"/caltest\" style=\"color:white;\">&#129354; Load cal-test (1 leg each)</a></button></div>");
+    if(rec_count>0)
+        A("Verify frame<br><a class=\"pm\" href=\"/verifyPrev\">&#9664;</a>"
+          "<span>%d / %d</span><a class=\"pm\" href=\"/verifyNext\">&#9654;</a><br>",
+          verify_idx+1, rec_count);
+    else
+        A("<p style=\"color:#999;\">Verify frame: none recorded yet</p>");
+    A("<div style=\"margin:6px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
+      "style=\"background:#27ae60;\"><a href=\"/play\" style=\"color:white;\">"
+      "&#9654; Play once</a></button></div>", ON(Play));
+    A("play move (ms/pose)<br><a class=\"pm\" href=\"/pspM\">-</a><span>%d</span>"
+      "<a class=\"pm\" href=\"/pspP\">+</a><br>", play_ms);
+    A("pose delay (ms/pose)<br><a class=\"pm\" href=\"/pdlM\">-</a><span>%d</span>"
+      "<a class=\"pm\" href=\"/pdlP\">+</a><br>", play_delay_ms);
+    A("<div style=\"margin:6px auto;\">"
+      "<button type=\"button\" style=\"background:#8e44ad;color:white;width:150px;\">"
+      "<a href=\"/mirror\" style=\"color:white;\">&#128260; Mirror R&#8594;L</a></button>"
+      "<button type=\"button\" style=\"background:#16a085;color:white;width:150px;\">"
+      "<a href=\"/recsave\" style=\"color:white;\">&#128190; Save to flash</a></button></div>");
 
     A("<hr><h3>MiniPupper Calibration Tool</h3>"
       "<p style=\"font-size:0.9rem;color:#666;\">Press 'Ini' first, then adjust offsets."
@@ -1165,6 +1595,7 @@ MOTION(h_back,Back) MOTION(h_left,Left)   MOTION(h_right,Right)
 MOTION(h_turnL,TurnL) MOTION(h_turnR,TurnR) MOTION(h_twerk,Twerk)
 MOTION(h_jump,Jump)
 MOTION(h_jumpfwd,JumpFwd)
+MOTION(h_backflip,Backflip)
 MOTION(h_testspeed,TestSpeed)
 MOTION(h_mate,Mate)
 MOTION(h_stanford,Stanford)
@@ -1202,19 +1633,143 @@ static esp_err_t h_calReset(httpd_req_t*r){
     return send_root(r);
 }
 
-// /leg8?v=NNN  -> hold servo 8 at raw SCS position NNN (0..1023, 511=centre)
-static esp_err_t h_leg8(httpd_req_t*r){
-    char q[32], val[8];
-    if(httpd_req_get_url_query_str(r,q,sizeof q)==ESP_OK &&
-       httpd_query_key_value(q,"v",val,sizeof val)==ESP_OK){
-        int p=atoi(val);
-        if(p<0) p=0;
-        if(p>1023) p=1023;
-        reset_all_modes();
-        started_once=1;
-        manual8_pos=(uint16_t)p;
-        manual8=1;
+// /leg?id=N&deg=D  -> hold servo N at angle D degrees (0-270).
+// Leaves all other servos at their neutral stand position.
+static esp_err_t h_leg(httpd_req_t*r){
+    char q[64], idv[8], degv[16];
+    int id = 0; float deg = 135;
+    if(httpd_req_get_url_query_str(r,q,sizeof q)==ESP_OK){
+        if(httpd_query_key_value(q,"id",idv,sizeof idv)==ESP_OK) id = atoi(idv);
+        if(httpd_query_key_value(q,"deg",degv,sizeof degv)==ESP_OK) deg = strtof(degv,NULL);
     }
+    if(id<1 || id>12) id=1;
+    if(deg<0) deg=0;
+    if(deg>270) deg=270;
+    reset_all_modes();
+    started_once=1;
+    // Set override for this servo; clear others
+    for(int i=1;i<=12;i++) manual_ovr[i] = 0;
+    manual_ovr[id] = 1;
+    manual_ovr_deg[id] = deg;
+    return send_root(r);
+}
+
+// ---- teach / record / playback handlers -------------------------------
+// Toggle teach mode: relax the legs to a low-torque follow so you can pose
+// them by hand. Pressing again exits back to the neutral stand.
+static esp_err_t h_relax(httpd_req_t*r){
+    started_once=1;
+    if(Relax){ Relax=0; reset_all_modes(); }
+    else     { reset_all_modes(); Relax=1; }
+    return send_root(r);
+}
+// Record: request a snapshot of the current hand pose (captured by the gait
+// task on its next pass, while in teach mode).
+static esp_err_t h_rec(httpd_req_t*r){
+    if(Relax && rec_count<MAX_FRAMES) rec_request=1;
+    return send_root(r);
+}
+static esp_err_t h_recclear(httpd_req_t*r){ rec_count=0; verify_idx=0; use_frame_timing=0; return send_root(r); }
+static esp_err_t h_recdel(httpd_req_t*r){                 // delete the last frame
+    if(rec_count>0) rec_count--;
+    if(verify_idx>=rec_count) verify_idx = rec_count>0 ? rec_count-1 : 0;
+    return send_root(r);
+}
+static esp_err_t h_mirror(httpd_req_t*r){ mirror_RL(); return send_root(r); }
+// Play the whole trace once (from the initial pose).
+static esp_err_t h_play(httpd_req_t*r){
+    if(rec_count>0){ reset_all_modes(); started_once=1; Play=1; }
+    return send_root(r);
+}
+// Verify: move to a specific frame at low speed / normal torque and hold it.
+static void start_goto(int f){
+    if(rec_count<=0) return;
+    if(f<0) f=0;
+    if(f>=rec_count) f=rec_count-1;
+    verify_idx=f; reset_all_modes(); started_once=1; goto_frame=f; Goto=1;
+}
+static esp_err_t h_verify(httpd_req_t*r){
+    char q[32], v[8]; int f=verify_idx;
+    if(httpd_req_get_url_query_str(r,q,sizeof q)==ESP_OK &&
+       httpd_query_key_value(q,"f",v,sizeof v)==ESP_OK) f=atoi(v);
+    start_goto(f);
+    return send_root(r);
+}
+static esp_err_t h_verifyPrev(httpd_req_t*r){ start_goto(verify_idx-1); return send_root(r); }
+static esp_err_t h_verifyNext(httpd_req_t*r){ start_goto(verify_idx+1); return send_root(r); }
+// Load the 28 optimized backflip poses into the trace buffer (as SCS) so the
+// Verify </> buttons step through the FLIP frames one by one.
+static esp_err_t h_bfload(httpd_req_t*r){
+    reset_all_modes();
+    int nf = BF_FRAMES < MAX_FRAMES ? BF_FRAMES : MAX_FRAMES;
+    for(int f=0; f<nf; f++)
+        for(int id=1; id<=12; id++){
+            float ang = BF_SIGN[id-1]*(BF_URDF_DEG[f][id-1] - BF_STAND[id-1]) + offset[id];
+            int sig = 511 + (int)(ang / 0.263f);
+            if(sig<0) sig=0;
+            if(sig>1023) sig=1023;
+            rec_frames[f][id] = (uint16_t)sig;
+        }
+    rec_count = nf; verify_idx = 0; use_frame_timing = 0;
+    return send_root(r);
+}
+// Load the hand-crafted (backflip_edit.py) poses into the trace.
+static esp_err_t h_bfload2(httpd_req_t*r){
+    reset_all_modes();
+    int nf = BF2_FRAMES < MAX_FRAMES ? BF2_FRAMES : MAX_FRAMES;
+    for(int f=0; f<nf; f++)
+        for(int id=1; id<=12; id++){
+            float ang = BF_SIGN[id-1]*(BF2_URDF_DEG[f][id-1] - BF_STAND[id-1]) + offset[id];
+            int sig = 511 + (int)(ang / 0.263f);
+            if(sig<0) sig=0;
+            if(sig>1023) sig=1023;
+            rec_frames[f][id] = (uint16_t)sig;
+        }
+    rec_count = nf; verify_idx = 0; use_frame_timing = 0;
+    return send_root(r);
+}
+// Web: load the calibration test (lift one leg at a time) into the trace.
+static esp_err_t h_caltest(httpd_req_t*r){
+    reset_all_modes();
+    int nf = CAL_FRAMES < MAX_FRAMES ? CAL_FRAMES : MAX_FRAMES;
+    for(int f=0; f<nf; f++)
+        for(int id=1; id<=12; id++){
+            float ang = BF_SIGN[id-1]*(CAL_URDF_DEG[f][id-1] - BF_STAND[id-1]) + offset[id];
+            int sig = 511 + (int)(ang / 0.263f);
+            if(sig<0) sig=0;
+            if(sig>1023) sig=1023;
+            rec_frames[f][id] = (uint16_t)sig;
+        }
+    rec_count = nf; verify_idx = 0; use_frame_timing = 0;
+    return send_root(r);
+}
+// Backflip 3: copy the hardcoded SCS frames + per-frame timing into the trace.
+static void load_bf3(void){
+    int nf = BF3_FRAMES < MAX_FRAMES ? BF3_FRAMES : MAX_FRAMES;
+    for(int f=0; f<nf; f++){
+        for(int id=1; id<=12; id++) rec_frames[f][id] = BF3_SCS[f][id];
+        frame_move_ms[f]  = BF3_MOVE_MS[f];
+        frame_delay_ms[f] = BF3_DELAY_MS[f];
+    }
+    rec_count = nf; verify_idx = 0; use_frame_timing = 1;
+}
+// Web: load Backflip 3 into the trace (then Verify </> or Play once).
+static esp_err_t h_bfload3(httpd_req_t*r){ reset_all_modes(); load_bf3(); return send_root(r); }
+// Web: load Backflip 3 and play it immediately with its per-frame timing.
+static esp_err_t h_bf3(httpd_req_t*r){ reset_all_modes(); load_bf3(); started_once=1; Play=1; return send_root(r); }
+static esp_err_t h_pspM(httpd_req_t*r){ if(play_ms>100){ play_ms-=100; nvs_put_int("play_ms",play_ms);} return send_root(r); }
+static esp_err_t h_pspP(httpd_req_t*r){ if(play_ms<3000){ play_ms+=100; nvs_put_int("play_ms",play_ms);} return send_root(r); }
+// Dwell/hold at each pose before moving to the next (ms). 0 = no pause.
+static esp_err_t h_pdlM(httpd_req_t*r){ if(play_delay_ms>0){ play_delay_ms-=100; if(play_delay_ms<0) play_delay_ms=0; nvs_put_int("play_dly",play_delay_ms);} return send_root(r); }
+static esp_err_t h_pdlP(httpd_req_t*r){ if(play_delay_ms<5000){ play_delay_ms+=100; nvs_put_int("play_dly",play_delay_ms);} return send_root(r); }
+// Teach-mode torque cap (mA): lower = limper / easier to pose by hand.
+static esp_err_t h_tcurM(httpd_req_t*r){ if(teach_cur>10){ teach_cur-=10; nvs_put_int("teach_cur",teach_cur);} return send_root(r); }
+static esp_err_t h_tcurP(httpd_req_t*r){ if(teach_cur<400){ teach_cur+=10; nvs_put_int("teach_cur",teach_cur);} return send_root(r); }
+// Persist the trace to flash so the recorded angles survive a reboot.
+static esp_err_t h_recsave(httpd_req_t*r){
+    nvs_set_i32(nvs,"rec_cnt",rec_count);
+    nvs_set_blob(nvs,"rec_fr",rec_frames,sizeof rec_frames);
+    nvs_commit(nvs);
     return send_root(r);
 }
 
@@ -1299,6 +1854,21 @@ static esp_err_t h_js(httpd_req_t*r){
     return httpd_resp_sendstr(r, "ok");
 }
 
+// LIVE POSE STREAM: current position of all 12 servos as CSV (SCS 0..1023),
+// e.g. "57,618,703,51,419,529,50,540,559,49,501,496". Poll this from the PC to
+// mirror the real robot into MuJoCo in real time (see teach_live.py).
+// Works in any mode; in `teach` the legs are limp so you can pose by hand.
+static esp_err_t h_pos(httpd_req_t*r){
+    char buf[128]; int n = 0;
+    for(int id=1; id<=12; id++)
+        n += snprintf(buf+n, sizeof(buf)-n, "%s%u",
+                      id==1 ? "" : ",", driver_board_present_position(id));
+    snprintf(buf+n, sizeof(buf)-n, "\n");
+    httpd_resp_set_type(r, "text/plain");
+    httpd_resp_set_hdr(r, "Access-Control-Allow-Origin", "*");
+    return httpd_resp_sendstr(r, buf);
+}
+
 // Live trace poll: read ALL control-loop values of one servo over SPI
 // (same set the AT32 uart_trace prints) and return them as text.
 static esp_err_t h_tracepoll(httpd_req_t*r){
@@ -1371,6 +1941,53 @@ static float api_qfloat(httpd_req_t*r, const char*key, float def){
 static esp_err_t api_json(httpd_req_t*r, const char*s){
     httpd_resp_set_type(r, "application/json");
     return httpd_resp_sendstr(r, s);
+}
+
+/* /api/angles : read all 12 servo present positions as JSON.
+ * Works WITHOUT CLI mode so you can monitor angles while the gait runs. */
+static esp_err_t h_api_angles(httpd_req_t*r){
+    char b[384]; int n = 0;
+    n += snprintf(b+n, sizeof b-n, "{\"ok\":true,\"angles\":[");
+    for(int id=1; id<=12; id++){
+        uint16_t pos = driver_board_present_position(id);
+        float deg = (float)pos * 270.0f / 1024.0f;
+        n += snprintf(b+n, sizeof b-n, "%s{\"id\":%d,\"scs\":%u,\"deg\":%.1f}",
+                      id==1?"":",", id, pos, deg);
+    }
+    n += snprintf(b+n, sizeof b-n, "]}");
+    return api_json(r,b);
+}
+
+/* /api/setangle?id=N&deg=D : set servo N to angle D (0-270).
+ * Works in TWO modes:
+ *   CLI mode ON  -> uses driver_board_direct() (gait paused, direct SPI)
+ *   CLI mode OFF -> uses the gait-task manual override mechanism
+ *                   (gait runs, just overrides this servo on each tick) */
+static esp_err_t h_api_setangle(httpd_req_t*r){
+    int id = api_qint(r,"id",0);
+    float deg = api_qfloat(r,"deg",135);
+    if(id<1 || id>12) return api_json(r,"{\"ok\":false,\"err\":\"bad id\"}");
+    if(deg<0 || deg>270) return api_json(r,"{\"ok\":false,\"err\":\"deg out of range (0-270)\"}");
+
+    if(CliMode){
+        // Direct SPI access (gait paused)
+        bool ok = driver_board_direct(id, DB_MODE_POSITION, deg, 200);
+        char b[128];
+        snprintf(b,sizeof b,"{\"ok\":%s,\"id\":%d,\"deg\":%.1f,\"mode\":\"direct\"}",
+                 ok?"true":"false", id, deg);
+        return api_json(r,b);
+    }else{
+        // Gait-task manual override (gait keeps running)
+        reset_all_modes();
+        started_once = 1;
+        for(int i=1;i<=12;i++) manual_ovr[i] = 0;
+        manual_ovr[id] = 1;
+        manual_ovr_deg[id] = deg;
+        char b[128];
+        snprintf(b,sizeof b,"{\"ok\":true,\"id\":%d,\"deg\":%.1f,\"mode\":\"override\"}",
+                 id, deg);
+        return api_json(r,b);
+    }
 }
 
 static esp_err_t h_api_status(httpd_req_t*r){
@@ -1511,7 +2128,7 @@ static void reg(httpd_handle_t s,const char*uri,esp_err_t(*h)(httpd_req_t*)){
 static void start_webserver(void){
     httpd_handle_t s=NULL;
     httpd_config_t cfg=HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers=80;
+    cfg.max_uri_handlers=110;   // base + teach/record + 24 calibration handlers
     cfg.stack_size=8192;
     cfg.core_id = 0;
     cfg.lru_purge_enable=true;
@@ -1523,8 +2140,23 @@ static void start_webserver(void){
     reg(s,"/ad",h_ad);       reg(s,"/back",h_back);   reg(s,"/left",h_left);
     reg(s,"/right",h_right); reg(s,"/turnL",h_turnL); reg(s,"/turnR",h_turnR);
     reg(s,"/twerk",h_twerk); reg(s,"/jump",h_jump); reg(s,"/jumpfwd",h_jumpfwd); reg(s,"/testspeed",h_testspeed);
+    reg(s,"/backflip",h_backflip);
     reg(s,"/mate",h_mate);
     reg(s,"/stanford",h_stanford);
+    reg(s,"/relax",h_relax);       reg(s,"/rec",h_rec);
+    reg(s,"/recclear",h_recclear); reg(s,"/recdel",h_recdel);
+    reg(s,"/mirror",h_mirror);     reg(s,"/play",h_play);
+    reg(s,"/verify",h_verify);     reg(s,"/verifyPrev",h_verifyPrev);
+    reg(s,"/verifyNext",h_verifyNext);
+    reg(s,"/bfload",h_bfload);
+    reg(s,"/bfload2",h_bfload2);
+    reg(s,"/bfload3",h_bfload3);   reg(s,"/bf3",h_bf3);
+    reg(s,"/caltest",h_caltest);
+    reg(s,"/pos",h_pos);           // live servo positions (CSV) for teach_live.py
+    reg(s,"/pspM",h_pspM);         reg(s,"/pspP",h_pspP);
+    reg(s,"/pdlM",h_pdlM);         reg(s,"/pdlP",h_pdlP);
+    reg(s,"/tcurM",h_tcurM);       reg(s,"/tcurP",h_tcurP);
+    reg(s,"/recsave",h_recsave);
     reg(s,"/climode",h_climode);
     reg(s,"/clicmd",h_clicmd);
     reg(s,"/clix",h_clix);
@@ -1532,6 +2164,8 @@ static void start_webserver(void){
     reg(s,"/js",h_js);
     reg(s,"/wizard",h_wizard);
     reg(s,"/api/status",h_api_status);
+    reg(s,"/api/angles",h_api_angles);
+    reg(s,"/api/setangle",h_api_setangle);
     reg(s,"/api/climode",h_api_climode);
     reg(s,"/api/dump",h_api_dump);
     reg(s,"/api/set",h_api_set);
@@ -1547,7 +2181,7 @@ static void start_webserver(void){
     reg(s,"/tiltM",h_tiltM);     reg(s,"/tiltP",h_tiltP);
     reg(s,"/sgsM",h_sgsM);       reg(s,"/sgsP",h_sgsP);
     reg(s,"/calReset",h_calReset);
-    reg(s,"/leg8",h_leg8);
+    reg(s,"/leg",h_leg);
     char uri[12];
     for(int i=1;i<=12;i++){
         snprintf(uri,sizeof uri,"/cal%dM",i); reg(s,strdup(uri),h_cal);
@@ -1647,6 +2281,92 @@ static void gait_task(void *arg){
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
 
+        }else if(Relax){
+            // TEACH MODE: low-torque follow so the legs can be posed by hand
+            // and stay roughly where you leave them. Each pass we command every
+            // servo to its OWN present position with a small current cap, so it
+            // gently resists gravity but yields to a firm push, then tracks the
+            // new position. If a Record was requested, snapshot the pose here
+            // (in the gait task, so we own the SPI bus and get a clean read).
+            cur_override_mA = (uint16_t)teach_cur;   // live-tunable, lower = limper
+            // IMPORTANT: driver_board_sync_write() INVERTS position (2700-x)
+            // when commanding, but driver_board_present_position() reports
+            // feedback WITHOUT that inversion. So present SCS runs opposite to
+            // the commanded SCS (goal[]) - for the same physical angle,
+            // present == 1023 - commanded. Convert feedback back into the
+            // command convention here so the leg is held where it actually is,
+            // and so recorded frames play back to the SAME physical pose.
+            for(int i=1;i<=12;i++){
+                int cmd = 1023 - (int)driver_board_present_position(i);
+                if(cmd<0) cmd=0;
+                if(cmd>1023) cmd=1023;
+                goal[i] = (uint16_t)cmd;
+            }
+            servo_flush();                       // gentle hold + refresh feedback
+            if(rec_request){
+                if(rec_count < MAX_FRAMES){
+                    for(int i=1;i<=12;i++){
+                        int cmd = 1023 - (int)driver_board_present_position(i);
+                        if(cmd<0) cmd=0;
+                        if(cmd>1023) cmd=1023;
+                        rec_frames[rec_count][i] = (uint16_t)cmd;
+                    }
+                    rec_count++;
+                    use_frame_timing = 0;   // taught frames use global timing
+                }
+                rec_request = 0;
+            }
+            vTaskDelay(1);
+
+        }else if(Play){
+            // PLAY the whole trace ONCE: go to the initial (stance) pose first,
+            // step pose-to-pose at low speed with NORMAL torque, then return to
+            // the stance pose at the end and hold there.
+            cur_override_mA = 0;
+            uint16_t ini[13]; fill_ini_frame(ini);
+            interp_to(ini, play_ms, &Play);      // "all start from initial position"
+            for(int f=0; f<rec_count && Play; f++){
+                // per-frame timing (Backflip 3) if loaded, else the globals
+                int mv = use_frame_timing ? frame_move_ms[f]  : play_ms;
+                int dl = use_frame_timing ? frame_delay_ms[f] : play_delay_ms;
+                if(mv < 1) mv = 1;
+                interp_to(rec_frames[f], mv, &Play);
+                dwell_ms(dl, &Play);              // dwell at this pose
+            }
+            if(Play) interp_to(ini, play_ms, &Play);   // ...and end back at stance
+            if(Play){
+                for(int i=1;i<=12;i++) hold_frame[i]=ini[i];
+                HoldPose = 1;
+            }
+            Play = 0;
+
+        }else if(GotoPose){
+            // Move to a single SCS pose typed in via the 'pose' command, then
+            // hold it (normal torque). Same easing as verify/play.
+            cur_override_mA = 0;
+            interp_to(pose_target, play_ms, &GotoPose);
+            for(int i=1;i<=12;i++) hold_frame[i]=pose_target[i];
+            HoldPose = 1;
+            GotoPose = 0;
+
+        }else if(Goto){
+            // VERIFY one keyframe: move to it at low speed / normal torque, then
+            // hold it so you can inspect the angles before committing to Play.
+            cur_override_mA = 0;
+            if(goto_frame>=0 && goto_frame<rec_count){
+                interp_to(rec_frames[goto_frame], play_ms, &Goto);
+                for(int i=1;i<=12;i++) hold_frame[i]=rec_frames[goto_frame][i];
+                HoldPose = 1;
+            }
+            Goto = 0;
+
+        }else if(HoldPose){
+            // Steady hold of the last played / verified pose (normal torque).
+            cur_override_mA = 0;
+            for(int i=1;i<=12;i++) goal[i]=hold_frame[i];
+            servo_flush();
+            vTaskDelay(1);
+
         }else if(Ini){
             servo_speed_all(0);
             for(int i=1; i<=12; i++) servo_write(i, offset[i]);
@@ -1687,22 +2407,28 @@ static void gait_task(void *arg){
                 rRIK(0,0,height+upHeight*sinf(tt)); fLIK(0,0,height+upHeight*sinf(tt)); servo_flush(); }
 
         }else if(Advance){
+            /* Walk direction: this gait's stride sweep runs the opposite way on
+             * this robot, so Advance drove it backwards. Negate the stride HERE
+             * (simple walk only) -- the Stanford gait and everything else that
+             * uses fRIK/fLIK/rRIK/rLIK are left untouched. Flip the sign to
+             * +stride to restore the original direction. */
+            const int astride = -stride;
             time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                fRIK(-stride*cosf(tt),0,height-upHeight*sinf(tt)); rLIK(-stride*cosf(tt),0,height-upHeight*sinf(tt));
-                rRIK( stride*cosf(tt),0,height);                   fLIK( stride*cosf(tt),0,height); servo_flush(); }
+                fRIK(-astride*cosf(tt),0,height-upHeight*sinf(tt)); rLIK(-astride*cosf(tt),0,height-upHeight*sinf(tt));
+                rRIK( astride*cosf(tt),0,height);                   fLIK( astride*cosf(tt),0,height); servo_flush(); }
             time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                fRIK( stride*sinf(tt),0,height-upHeight*cosf(tt)); rLIK( stride*sinf(tt),0,height-upHeight*cosf(tt));
-                rRIK(-stride*sinf(tt),0,height);                   fLIK(-stride*sinf(tt),0,height); servo_flush(); }
+                fRIK( astride*sinf(tt),0,height-upHeight*cosf(tt)); rLIK( astride*sinf(tt),0,height-upHeight*cosf(tt));
+                rRIK(-astride*sinf(tt),0,height);                   fLIK(-astride*sinf(tt),0,height); servo_flush(); }
             time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                fRIK( stride*cosf(tt),0,height);                   rLIK( stride*cosf(tt),0,height);
-                rRIK(-stride*cosf(tt),0,height-upHeight*sinf(tt)); fLIK(-stride*cosf(tt),0,height-upHeight*sinf(tt)); servo_flush(); }
+                fRIK( astride*cosf(tt),0,height);                   rLIK( astride*cosf(tt),0,height);
+                rRIK(-astride*cosf(tt),0,height-upHeight*sinf(tt)); fLIK(-astride*cosf(tt),0,height-upHeight*sinf(tt)); servo_flush(); }
             time_mSt=millis(); tim=0;
             while(tim<period){ tim=millis()-time_mSt; tt=(float)(tim*PI/2/period);
-                fRIK(-stride*sinf(tt),0,height);                   rLIK(-stride*sinf(tt),0,height);
-                rRIK( stride*sinf(tt),0,height-upHeight*cosf(tt)); fLIK( stride*sinf(tt),0,height-upHeight*cosf(tt)); servo_flush(); }
+                fRIK(-astride*sinf(tt),0,height);                   rLIK(-astride*sinf(tt),0,height);
+                rRIK( astride*sinf(tt),0,height-upHeight*cosf(tt)); fLIK( astride*sinf(tt),0,height-upHeight*cosf(tt)); servo_flush(); }
             ESP_LOGI(TAG, "cur(mA): 1=%d 2=%d 3=%d 4=%d 5=%d 6=%d 7=%d 8=%d 9=%d 10=%d 11=%d 12=%d",
                 driver_board_present_current(1),  driver_board_present_current(2),
                 driver_board_present_current(3),  driver_board_present_current(4),
@@ -1825,6 +2551,52 @@ static void gait_task(void *arg){
                 float zr = fmaxf(zLo, fminf(zHi, rearMidZ + rearAmp*sinf(tt)));
                 fRIK(0,0,frontZ); fLIK(0,0,frontZ);
                 rRIK(0,0,zr); rLIK(0,0,zr); servo_flush(); }
+
+        }else if(Backflip){
+            // ==================================================================
+            // OPTIMIZED BACKFLIP -- SAFE BENCH DEMO (position-sequenced).
+            // Steps through the flip keyframes, WAITING for the servos to reach
+            // each pose (using position feedback) before advancing. This plays
+            // the SHAPES of the backflip; it will NOT leave the ground -- a real
+            // flip needs ~500 rpm joint speed the servos can't reach. Use it to
+            // verify the motion + servo directions safely.
+            //
+            //  !!! FIRST RUN: hold/prop the robot and check each leg moves the
+            //  RIGHT way. If a joint runs backwards, flip its sign in BF_SIGN[]
+            //  (mp2_backflip_data.h) and re-flash. A wrong sign at speed breaks it.
+            // ==================================================================
+            const float BF_TOL_DEG    = 6.0f;    // "reached" tolerance (deg)
+            const int   BF_TIMEOUT_MS = 1200;    // max wait per keyframe (ms)
+
+            servo_speed_all(0);   // current cap applied in servo_flush()
+
+            for(int fr=0; fr<BF_FRAMES && Backflip; fr++){
+                float tgt[13];
+                for(int id=1; id<=12; id++){
+                    tgt[id] = BF_SIGN[id-1]*(BF_URDF_DEG[fr][id-1] - BF_STAND[id-1]) + offset[id];
+                    servo_write(id, tgt[id]);
+                }
+                servo_flush();
+
+                uint32_t t0 = millis();
+                while(Backflip){
+                    servo_flush();   // re-send + refresh position feedback
+                    bool all_ok = true;
+                    for(int id=1; id<=12; id++){
+                        float now = ((int)driver_board_present_position(id) - 511) * 0.263f;
+                        if(fabsf(now - tgt[id]) > BF_TOL_DEG){ all_ok = false; break; }
+                    }
+                    if(all_ok) break;
+                    if(millis()-t0 > BF_TIMEOUT_MS) break;
+                    vTaskDelay(pdMS_TO_TICKS(5));
+                }
+            }
+
+            // park back in the neutral stand
+            fRIK(0,0,NEUTRAL_Z); fLIK(0,0,NEUTRAL_Z);
+            rRIK(0,0,NEUTRAL_Z); rLIK(0,0,NEUTRAL_Z);
+            servo_flush();
+            Backflip = 0;
 
         }else if(Jump){
             float crouchZ = 40;
@@ -2050,31 +2822,38 @@ static void gait_task(void *arg){
             if(now > sg_next_us + 100000) sg_next_us = now;
             while(esp_timer_get_time() < sg_next_us && Stanford) vTaskDelay(1);
 
-        }else if(manual8){
-            // Hold a neutral stand, but drive servo 8 to the manually entered
-            // position instead of the value the IK just computed.
-            servo_speed_all(0);
-            fRIK(0,0,height); rRIK(0,0,height); fLIK(0,0,height); rLIK(0,0,height);
-            goal[8] = manual8_pos;   // override just servo 8
-            servo_flush();
-            vTaskDelay(1);
-
-        }else if(!started_once){
-            // POWER-ON POSE: stand at the calibrated `height` (x=0, so no
-            // backward jerk - just the legs extending to the proper stand),
-            // the SAME height Advance and the idle hold use, so boot is level
-            // and matches every mode instead of sitting low at the 70mm centre.
-            servo_speed_all(0);
-            fRIK(0,0,height); fLIK(0,0,height); rRIK(0,0,height); rLIK(0,0,height);
-            servo_flush();
-            pose_x = 0; pose_z = height;
-            vTaskDelay(1);
-
         }else{
-            fRIK(0,0,height); rRIK(0,0,height); fLIK(0,0,height); rLIK(0,0,height);
-            servo_flush();
-            pose_x = 0; pose_z = height;
-            vTaskDelay(1);
+            // Check if any servo has a manual override set.
+            int any_ovr = 0;
+            for(int i=1;i<=12;i++){ if(manual_ovr[i]){ any_ovr=1; break; } }
+            if(any_ovr){
+                // Hold a neutral stand, but drive overridden servos to their
+                // manually entered degree positions instead of the IK values.
+                servo_speed_all(0);
+                fRIK(0,0,height); rRIK(0,0,height); fLIK(0,0,height); rLIK(0,0,height);
+                for(int i=1;i<=12;i++){
+                    if(manual_ovr[i]){
+                        int scs = (int)(manual_ovr_deg[i] * 1024.0f / 270.0f);
+                        if(scs<0) scs=0;
+                        if(scs>1023) scs=1023;
+                        goal[i] = (uint16_t)scs;
+                    }
+                }
+                servo_flush();
+                vTaskDelay(1);
+            }else if(!started_once){
+                // POWER-ON POSE: stand at the calibrated `height`.
+                servo_speed_all(0);
+                fRIK(0,0,height); fLIK(0,0,height); rRIK(0,0,height); rLIK(0,0,height);
+                servo_flush();
+                pose_x = 0; pose_z = height;
+                vTaskDelay(1);
+            }else{
+                fRIK(0,0,height); rRIK(0,0,height); fLIK(0,0,height); rLIK(0,0,height);
+                servo_flush();
+                pose_x = 0; pose_z = height;
+                vTaskDelay(1);
+            }
         }
     }
 }
@@ -2094,8 +2873,16 @@ void app_main(void){
     if(nvs_get_i32(nvs,"period",&v)==ESP_OK) period=v;
     if(nvs_get_i32(nvs,"height",&v)==ESP_OK) height=v;
     if(nvs_get_i32(nvs,"sgspeed",&v)==ESP_OK) sgspeed=v;
+    if(nvs_get_i32(nvs,"play_ms",&v)==ESP_OK) play_ms=v;
+    if(nvs_get_i32(nvs,"play_dly",&v)==ESP_OK && v>=0 && v<=5000) play_delay_ms=v;
+    if(nvs_get_i32(nvs,"teach_cur",&v)==ESP_OK && v>=10 && v<=400) teach_cur=v;
     for(int i=1;i<=12;i++){ char k[12]; snprintf(k,sizeof k,"offset%d",i);
         offset[i]=nvs_get_float(k, offset[i]); }
+
+    // Reload the saved teach/record trace ("hardcoded" hand poses).
+    if(nvs_get_i32(nvs,"rec_cnt",&v)==ESP_OK && v>=0 && v<=MAX_FRAMES) rec_count=v;
+    { size_t sz=sizeof rec_frames;
+      nvs_get_blob(nvs,"rec_fr",rec_frames,&sz); }
 
     wifi_init_sta();
     start_webserver();
