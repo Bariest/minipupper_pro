@@ -21,20 +21,23 @@
 #pragma once
 #include <stdint.h>
 
-#define BF3_FRAMES 8
+#define BF3_FRAMES 7
 
-static const uint16_t BF3_SCS[BF3_FRAMES][13] = {
-    /* idx      1    2    3    4    5    6    7    8    9   10   11   12 */
-    {   0,     49,422,371,60,570,690,53,442,436,969,548,698 }, /* 0 start */
-    {   0,     62,599,598,52,441,479,53,445,439,968,540,700 }, /* 1 */
-    //{   0,     54,381,519,49,629,598,51,259,518,48,726,524}, /* 2 */
-    {0 ,        51,405,372,60,546,672,63,607,629,980,386,584},
-    {   0,     62,613,577,49,424,509,50,407,645,961,634,475}, /* 2 */
-    {   0,     70,639,603,45,386,474,60,577,610,976,402,604}, /* 3 */
-    {   0,     53,443,392,54,524,700,54,475,817,967,584,312}, /* 4 */
-    {   0,    53,444,391,54,524,700,59,552,717,965,570,593 }, /* 5 */
-    {   0,     51,427,520,60,593,568,62,615,714,970,527,566 }, /* 6 end (= start) */
-};
+//good old with old calibration values
+// static const uint16_t BF3_SCS[BF3_FRAMES][13] = {
+//     /* idx      1    2    3    4    5    6    7    8    9   10   11   12 */
+//     {   0,     53,514,332,976,451,735,41,683,289,334,426,716}, /* 0 start */
+//     {   0,     53,488,290,975,491,786,56,597,432,499,462,593}, /* 1 */
+//     //{   0,     54,381,519,49,629,598,51,259,518,48,726,524}, /* 2 */
+//     {0 ,        59,565,559,969,407,481,56,560,436,502,508,530},
+//     {   0,     59,561,559,963,408,480,61,420,579,598,630,417}, /* 2 */
+//     {   0,     52,481,285,964,444,791,74,387,746,785,617,241}, /* 3 */
+//     {   0,     52,482,286,965,440,795,43,549,303,354,574,671}, /* 4 */
+//     {   0,    69,740,131,965,262,920,46,553,304,371,571,671}, /* 5 */
+//     //{   0,     51,427,520,60,593,568,62,615,714,970,527,566 }, /* 6 end (= start) */
+// };
+
+
 
 // ---- PER-FRAME TIMING (edit these freely) --------------------------------
 // One value per frame, so every transition can have its own speed and its own
@@ -48,5 +51,14 @@ static const uint16_t BF3_SCS[BF3_FRAMES][13] = {
 // Example below: ease into the start (frame 0), snap through the flip poses
 // (frames 1-4) fast with no pause, brief hold at frame 5, then settle back to
 // the start pose (frame 6). Tune each number to taste.
-static const int BF3_MOVE_MS[BF3_FRAMES]  = {  1000,  1000,   30,  100,  50,  50,  200,  800 };
-static const int BF3_DELAY_MS[BF3_FRAMES] = {  500,   400,  200,    200,    50,   300,  500,  300 };
+
+//Good - old config
+//move_ms[a]: from frame a-1 to frame a 
+// static const int BF3_MOVE_MS[BF3_FRAMES]  = {  500,  250,   50,  50,  50,  100,  250};
+// //delay_ms[a]: after frame executing frame a, stay ...ms before moving to the frame a+1 
+// static const int BF3_DELAY_MS[BF3_FRAMES] = {  500,   1000,  5,    20,    30,   150};
+
+//move_ms[a]: from frame a-1 to frame a 
+// static const int BF3_MOVE_MS[BF3_FRAMES]  = {  500,  250,   50,  50,  50,  100,  250};
+// //delay_ms[a]: after frame executing frame a, stay ...ms before moving to the frame a+1 
+// static const int BF3_DELAY_MS[BF3_FRAMES] = {  500,   1000,  10,    70,    30,   150};

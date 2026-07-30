@@ -51,7 +51,7 @@ extern "C" {
  * offset[] calibration all address the same servo by the same id. Set
  * SERVO_BOARD and re-flash to switch builds.
  * ---------------------------------------------------------------------- */
-#define SERVO_BOARD 4
+#define SERVO_BOARD 5
 
 static inline int db_phys(int logical){
 #if SERVO_BOARD == 2
@@ -76,12 +76,12 @@ static inline int db_phys(int logical){
         default: return logical;
     }
 
-#elif SERVO_BOARD == 4  //White pupper
+#elif SERVO_BOARD == 4  //White pupper  -   Already 5 ports are broken
     /* abduction <-> knee (calf) swap: calf servo plugged into abduction port.
      * 1<->3, 4<->6, 7<->9, 10<->12; hips 2,5,8,11 unchanged. */
     switch(logical){
         // 8 servos connected: 4 calves (3,6,9,12) + 4 thighs (2,5,8,11).
-        // 4 abductions (1,4,7,10) on broken ports (3,12,9,8) — no servo.
+        // 4 abductions (1,4,7,10) on broken ports (3,12,9,8,6) — no servo.
         // Port 1→Calf3  Port 2→Thigh2  Port 4→Calf6  Port 5→Thigh5
         // Port 6→Thigh8  Port 7→Calf9  Port 10→Calf12  Port 11→Thigh11
         case 1:  return 3;   // FR Abd   → physical 3 (broken)
@@ -99,6 +99,32 @@ static inline int db_phys(int logical){
         default: return logical;
     }
 
+    #elif SERVO_BOARD == 5  //White pupper //Important: change this one db_phys_inv
+    switch(logical){
+        /*
+        calf_FL = 3 
+        hip_FL = 2
+        calf_FR = 1
+        hip FR = 7
+        hip RR = 8
+        calf RR = 9
+        hip RL = 12
+        calf RL = 11 
+        */
+        case 6:  return 3;   // FR Abd   → physical 3 (broken)
+        case 5:  return 2;   // FR Thigh → physical 2
+        case 3:  return 1;   // FR Calf  → physical 1
+        case 2:  return 7;  // FL Abd   → physical 12 (broken)
+        case 8:  return 8;   // FL Thigh → physical 5
+        case 9:  return 9;   // FL Calf  → physical 4
+        case 11:  return 12;   // RR Abd   → physical 9 (broken)
+        case 12:  return 11;   // RR Thigh → physical 6 (cross-board: FL board CS10)
+        case 1:  return 4;   // RR Calf  → physical 7
+        case 4: return 5;   // RL Abd   → physical 8 (broken)
+        case 7: return 6;  // RL Thigh → physical 11
+        case 10: return 10;  // RL Calf  → physical 10
+        default: return logical;
+    }
 
 #else
     return logical;
@@ -110,28 +136,44 @@ static inline int db_phys(int logical){
  * Unlike db_phys(), this is NOT required to be symmetric — it handles
  * cross-board wiring (e.g. RR servo plugged into the FL board). */
 static inline int db_phys_inv(int physical){
+#if SERVO_BOARD == 5
+    switch(physical){
+        case 1:  return 3;   // physical 1  → FR Calf  (logical 3)
+        case 2:  return 5;   // physical 2  → FR Thigh (logical 5)
+        case 3:  return 6;   // physical 3  → FR Abd   (logical 6, broken)
+        case 4:  return 1;   // physical 4  → RR Calf  (logical 1)
+        case 5:  return 4;   // physical 5  → RL Abd   (logical 4, broken)
+        case 6:  return 7;   // physical 6  → RL Thigh (logical 7)
+        case 7:  return 2;   // physical 7  → FL Abd   (logical 2, broken)
+        case 8:  return 8;   // physical 8  → FL Thigh (logical 8)
+        case 9:  return 9;   // physical 9  → FL Calf  (logical 9)
+        case 10: return 10;  // physical 10 → RL Calf  (logical 10)
+        case 11: return 12;  // physical 11 → RR Thigh (logical 12)
+        case 12: return 11;  // physical 12 → RR Abd   (logical 11, broken)
+        default: return physical;
+    }
+#else
+    // original mapping for SERVO_BOARD 1 (default)
     switch(physical){
         // FR board (CS9): ports 1,2,3
         case 1:  return 3;   // FR Calf  -> logical 3
         case 2:  return 2;   // FR Thigh -> logical 2
         case 3:  return 1;   // broken   -> logical 1 (FR Abd, no servo)
-
         // FL board (CS10): ports 4,5,6
         case 4:  return 6;   // FL Calf  -> logical 6
         case 5:  return 5;   // FL Thigh -> logical 5
         case 6:  return 8;   // RR Thigh -> logical 8 (cross-board!)
-
         // RR board (CS21): ports 7,8,9
         case 7:  return 9;   // RR Calf  -> logical 9
         case 8:  return 10;  // broken   -> logical 10 (RL Abd, no servo)
         case 9:  return 7;   // broken   -> logical 7 (RR Abd, no servo)
-
         // RL board (CS14): ports 10,11,12
         case 10: return 12;  // RL Calf  -> logical 12
         case 11: return 11;  // RL Thigh -> logical 11
         case 12: return 4;   // broken   -> logical 4 (FL Abd, no servo)
         default: return physical;
     }
+#endif
 }
 
 /* Initialise the SPI bus, the 4 driver-board devices, and the power-enable pin.
