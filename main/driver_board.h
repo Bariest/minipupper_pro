@@ -99,30 +99,20 @@ static inline int db_phys(int logical){
         default: return logical;
     }
 
-    #elif SERVO_BOARD == 5  //White pupper //Important: change this one db_phys_inv
+    #elif SERVO_BOARD == 5  // White pupper (ports 4,5,6,8 broken; abduction servos unused)
     switch(logical){
-        /*
-        calf_FL = 3 
-        hip_FL = 2
-        calf_FR = 1
-        hip FR = 7
-        hip RR = 8
-        calf RR = 9
-        hip RL = 12
-        calf RL = 11 
-        */
-        case 6:  return 3;   // FR Abd   → physical 3 (broken)
-        case 5:  return 2;   // FR Thigh → physical 2
-        case 3:  return 1;   // FR Calf  → physical 1
-        case 2:  return 7;  // FL Abd   → physical 12 (broken)
-        case 8:  return 8;   // FL Thigh → physical 5
-        case 9:  return 9;   // FL Calf  → physical 4
-        case 11:  return 12;   // RR Abd   → physical 9 (broken)
-        case 12:  return 11;   // RR Thigh → physical 6 (cross-board: FL board CS10)
-        case 1:  return 4;   // RR Calf  → physical 7
-        case 4: return 5;   // RL Abd   → physical 8 (broken)
-        case 7: return 6;  // RL Thigh → physical 11
-        case 10: return 10;  // RL Calf  → physical 10
+        case 6:  return 3;   // logical  6 (calf)  → physical 3
+        case 5:  return 2;   // logical  5 (thigh) → physical 2
+        case 3:  return 1;   // logical  3 (calf)  → physical 1
+        case 2:  return 7;   // logical  2 (thigh) → physical 7
+        case 8:  return 11;  // logical  8 (thigh) → physical 11
+        case 9:  return 9;   // logical  9 (calf)  → physical 9
+        case 11: return 12;  // logical 11 (thigh) → physical 12
+        case 12: return 10;  // logical 12 (calf)  → physical 10
+        case 1:  return 4;   // logical  1 (abd)   → physical 4  (broken)
+        case 4:  return 5;   // logical  4 (abd)   → physical 5  (broken)
+        case 7:  return 6;   // logical  7 (abd)   → physical 6  (broken)
+        case 10: return 8;   // logical 10 (abd)   → physical 8  (broken)
         default: return logical;
     }
 
@@ -138,18 +128,18 @@ static inline int db_phys(int logical){
 static inline int db_phys_inv(int physical){
 #if SERVO_BOARD == 5
     switch(physical){
-        case 1:  return 3;   // physical 1  → FR Calf  (logical 3)
-        case 2:  return 5;   // physical 2  → FR Thigh (logical 5)
-        case 3:  return 6;   // physical 3  → FR Abd   (logical 6, broken)
-        case 4:  return 1;   // physical 4  → RR Calf  (logical 1)
-        case 5:  return 4;   // physical 5  → RL Abd   (logical 4, broken)
-        case 6:  return 7;   // physical 6  → RL Thigh (logical 7)
-        case 7:  return 2;   // physical 7  → FL Abd   (logical 2, broken)
-        case 8:  return 8;   // physical 8  → FL Thigh (logical 8)
-        case 9:  return 9;   // physical 9  → FL Calf  (logical 9)
-        case 10: return 10;  // physical 10 → RL Calf  (logical 10)
-        case 11: return 12;  // physical 11 → RR Thigh (logical 12)
-        case 12: return 11;  // physical 12 → RR Abd   (logical 11, broken)
+        case 1:  return 3;   // physical 1  → logical  3 (calf)
+        case 2:  return 5;   // physical 2  → logical  5 (thigh)
+        case 3:  return 6;   // physical 3  → logical  6 (calf)
+        case 4:  return 1;   // physical 4  → logical  1 (abd, broken)
+        case 5:  return 4;   // physical 5  → logical  4 (abd, broken)
+        case 6:  return 7;   // physical 6  → logical  7 (abd, broken)
+        case 7:  return 2;   // physical 7  → logical  2 (thigh)
+        case 8:  return 10;  // physical 8  → logical 10 (abd, broken)
+        case 9:  return 9;   // physical 9  → logical  9 (calf)
+        case 10: return 12;  // physical 10 → logical 12 (calf)
+        case 11: return 8;   // physical 11 → logical  8 (thigh)
+        case 12: return 11;  // physical 12 → logical 11 (thigh)
         default: return physical;
     }
 #else
