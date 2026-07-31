@@ -43,7 +43,7 @@
 // to match the new centre/neutral pose. Index [0] is unused.
 static const uint16_t BF3_REF[13] = {
     /* idx  1     2    3    4    5    6    7    8    9   10   11   12 */
-           1023,  642,  507, 1023,  349,  742, 1023,  695,  576,  491,  346,  800
+           1023,  511,  684, 1023,  513,  671, 1023,  504,  731,  471,  512,  585
 };
 
 // ---- DELTA FRAMES (frames 1..6, relative to BF3_REF) --------------------
@@ -51,33 +51,34 @@ static const uint16_t BF3_REF[13] = {
 // After recalibration these do NOT change — they store the RELATIVE motion.
 // Index [0] of each row is unused.
 static const int16_t BF3_DELTA[BF3_FRAMES - 1][13] = {
-    /* frame 0 — crouch (same as ref) */
-    {0, 0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0},
+    /* frame 0 —  (same as ref) */
+    {0, 0,    -6,     0,     0,     0,     1,     0,   139,    51,   -35,  -116,   -90},
 
      /* frame 1 — crouch (same as ref) */
-    {0,     0,  -178,   -15,     0,   194,    17,     0,   -52,   159,  -108,    48,  -160},
+    {0,     0,   -58,   -70,     0,   -36,   142,     0,   132,    50,   -41,  -115,   -89},
     
     /* frame 2 — front leg lifting */
-    {0, 1023,  610,  680, 1023,  404,  527, 1023,  570,  711,  478,  391,  644},
+    {0, 0,   162,    75,     0,  -159,   -64,     0,   132,    33,   105,  -116,   -10},
     /* frame 3 — back leg rotating */
-    {0, 0,  105,  119,    0, -141, -208,    0, -161,  243,    7,   69, -297},
+    {0, 0,   147,   103,     0,  -135,  -104,     0,  -104,   138,    89,    74,  -159},
     /* frame 4 — back leg pushing */
-    {0, 0,  104,  117,    0, -142, -208,    0,  -58,  328,   41,   49, -398},
+    {0, 0,   152,   106,     0,   -94,   -76,     0,   -11,   277,    88,     8,  -283},
     /* frame 5 — retract front leg */
-    {0, 0,  200, -170,    0, -145,  165,    0,  -66,  309,   37,   43, -398},
+    {0, 0,   169,  -248,     0,  -192,   254,     0,   -23,   179,   104,    19,  -167},
     /* frame 6 — back leg retracting and front leg landing */
-    {0, 0,  197, -169,    0, -146,  164,    0,   66, -123,   -2,   20,   20},
+    {0,  0,   164,  -267,     0,  -178,   284,     0,   173,  -119,   104,  -175,   127},
 };
 
 // ---- PER-FRAME TIMING (edit these freely) --------------------------------
 // BF3_MOVE_MS[f]  = time to MOVE into frame f from the previous pose.
 // BF3_DELAY_MS[f] = time to HOLD/DWELL on frame f after arriving.
-static const int BF3_MOVE_MS[BF3_FRAMES]  = {1000, 1000, 1000, 1000, 1000, 1000, 1000};
-static const int BF3_DELAY_MS[BF3_FRAMES] = { 500,  500,  500,  500,  500,  500};
+
+//static const int BF3_MOVE_MS[BF3_FRAMES]  = {1000, 1000, 1000, 1000, 1000, 1000, 1000};
+//static const int BF3_DELAY_MS[BF3_FRAMES] = { 500,  500,  500,  500,  500,  500};
 
 
 // //move_ms[a]: from frame a-1 to frame a 
-// static const int BF3_MOVE_MS[BF3_FRAMES]  = {  500,  250,   50,  50,  50,  100,  250};
+ static const int BF3_MOVE_MS[BF3_FRAMES]  = {  1000,  1000,   30,  50,  30,  100,  150};
 // //delay_ms[a]: after frame executing frame a, stay ...ms before moving to the frame a+1 
-// static const int BF3_DELAY_MS[BF3_FRAMES] = {  500,   1000,  5,    20,    30,   150};
+ static const int BF3_DELAY_MS[BF3_FRAMES] = {  500,   5000,  5,    20,    30,   150};
 
