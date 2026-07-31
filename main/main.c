@@ -143,6 +143,11 @@ static int frame_delay_ms[MAX_FRAMES];   /* per-frame dwell time (ms)           
 static int use_frame_timing = 0; /* 1 = use the per-frame arrays above          */
 static uint16_t cur_override_mA = 0;  /* 0 = normal cap; else force this cap    */
 
+// Backflip-specific recording (exports REF + DELTA for hardcode_backflip_angle.h)
+static uint16_t bf_ref[13] = {0};          /* reference frame (absolute SCS)    */
+static uint16_t bf_frames[MAX_FRAMES][13]; /* all recorded frames (absolute SCS)*/
+static int bf_count = 0;                   /* number of recorded frames         */
+
 static inline void servo_speed(int ch, uint16_t spd){
     goal_speed[ch] = spd;
 }
@@ -557,6 +562,63 @@ static void serial_handle_line(char *line){
         printf("(%d frames)\n", rec_count);
         return;
     }
+    // ---- Backflip teach/rec/recdump (exports REF+DELTA for hardcode_backflip_angle.h) ----
+    if(!strcmp(line,"teach_backflip")){
+        started_once=1;
+        if(Relax){ Relax=0; reset_all_modes(); printf("teach OFF (back to stand)\n"); }
+        else     { reset_all_modes(); Relax=1;  printf("teach ON - pose legs by hand, 'rec_bf' to capture\n"); }
+        return;
+    }
+    if(!strcmp(line,"rec_bf")){
+        if(!Relax){ printf("run 'teach_backflip' first\n"); return; }
+        if(bf_count >= MAX_FRAMES){ printf("max %d frames reached\n", MAX_FRAMES); return; }
+        for(int i=1; i<=12; i++){
+            int cmd = 1023 - (int)driver_board_present_position(i);
+            if(cmd<0) cmd=0; 
+            if(cmd>1023) cmd=1023;
+            if(bf_count == 0) bf_ref[i] = (uint16_t)cmd;
+            bf_frames[bf_count][i] = (uint16_t)cmd;
+        }
+        bf_count++;
+        printf("rec_bf: frame %d saved (%s)\n", bf_count, bf_count==1 ? "REFERENCE" : "delta from REF");
+        return;
+    }
+    if(!strcmp(line,"recdel_bf")){
+        if(bf_count>0) bf_count--;
+        printf("recdel_bf: %d frames left\n", bf_count);
+        return;
+    }
+    if(!strcmp(line,"recclear_bf")){
+        bf_count=0;
+        printf("recclear_bf: cleared\n");
+        return;
+    }
+    if(!strcmp(line,"recdump_bf")){
+        if(bf_count<1){ printf("no frames recorded. Use teach_backflip + rec_bf first.\n"); return; }
+        printf("// === paste below into hardcode_backflip_angle.h ===\n");
+        printf("#define BF3_FRAMES %d\n\n", bf_count);
+        printf("// ---- REFERENCE POSE (frame 0) ----\n");
+        printf("static const uint16_t BF3_REF[13] = {\n");
+        printf("    /* idx  1     2     3     4     5     6     7     8     9    10    11    12 */\n");
+        printf("           ");
+        for(int i=1;i<=12;i++) printf("%s%4u%s", i==1?"":" ", bf_ref[i], i<12?",":"");
+        printf("\n};\n\n");
+        if(bf_count > 1){
+            printf("// ---- DELTA FRAMES (frames 1..%d) ----\n", bf_count-1);
+            printf("static const int16_t BF3_DELTA[%d][13] = {\n", bf_count-1);
+            for(int f=1; f<bf_count; f++){
+                printf("    {0");
+                for(int i=1;i<=12;i++){
+                    int d = (int)bf_frames[f][i] - (int)bf_ref[i];
+                    printf(", %5d", d);
+                }
+                printf("},  /* frame %d */\n", f);
+            }
+            printf("};\n");
+        }
+        printf("// === end of backflip data ===\n");
+        return;
+    }
     // Set the STAND CALIBRATION from a recdump neutral row: 12 SCS values.
     //   setcal 57,634,649,50,400,551,50,589,534,50,486,495
     // Stores offset[id] = (scs-511)*0.263 for all 12 servos and saves to NVS,
@@ -613,6 +675,31 @@ static void serial_handle_line(char *line){
                v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11],v[12]);
         return;
     }
+
+    // ---- pose_bf: move to a pose specified as DELTAS from BF3_REF ----------
+    // Usage: pose_bf d1,d2,...,d12  (12 signed delta values)
+    // Computes absolute SCS = BF3_REF[id] + delta, clamped to 0..1023,
+    // then eases into that pose like the normal 'pose' command.
+    if(!strncmp(line,"pose_bf",7) && (line[7]==' ' || line[7]==',' || line[7]=='\t' || line[7]=='\0')){
+        if(line[7]=='\0'){ printf("usage: pose_bf d1,d2,...,d12  (12 signed delta values)\n"); return; }
+        char tmp[160]; strncpy(tmp,line+8,sizeof tmp-1); tmp[sizeof tmp-1]=0;
+        int v[13]; int n=0; char *sp_bf=NULL;
+        for(char *tk=strtok_r(tmp," ,\t",&sp_bf); tk && n<12; tk=strtok_r(NULL," ,\t",&sp_bf)){
+            int delta = atoi(tk);
+            int scs = (int)BF3_REF[n] + delta;  // n is already 1-indexed (++n above)
+            if(scs<0) scs=0;
+            if(scs>1023) scs=1023;
+            v[++n] = scs;
+        }
+        if(n!=12){ printf("pose_bf: need 12 delta values (got %d)\n", n); return; }
+        reset_all_modes();
+        for(int i=1;i<=12;i++) pose_target[i]=(uint16_t)v[i];
+        started_once=1; GotoPose=1;
+        printf("pose_bf: moving to delta->SCS %d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+               v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11],v[12]);
+        return;
+    }
+
     if(!strcmp(line,"mirror")){ mirror_RL(); printf("mirrored R->L on %d frames\n", rec_count); return; }
     if(!strcmp(line,"play")){
         if(rec_count>0){ reset_all_modes(); started_once=1; Play=1; printf("playing %d frames\n", rec_count); }
@@ -708,7 +795,7 @@ static void serial_handle_line(char *line){
         int nf = BF3_FRAMES < MAX_FRAMES ? BF3_FRAMES : MAX_FRAMES;
         for(int f=0; f<nf; f++){
             for(int id=1; id<=12; id++)
-                rec_frames[f][id] = BF3_SCS[f][id];
+                rec_frames[f][id] = (uint16_t)((int)BF3_REF[id] + (f==0 ? 0 : (int)BF3_DELTA[f-1][id]));
             frame_move_ms[f]  = BF3_MOVE_MS[f];   // per-frame speed
             frame_delay_ms[f] = BF3_DELAY_MS[f];  // per-frame dwell
         }
@@ -724,7 +811,7 @@ static void serial_handle_line(char *line){
         int nf = BF3_FRAMES < MAX_FRAMES ? BF3_FRAMES : MAX_FRAMES;
         for(int f=0; f<nf; f++){
             for(int id=1; id<=12; id++)
-                rec_frames[f][id] = BF3_SCS[f][id];
+                rec_frames[f][id] = (uint16_t)((int)BF3_REF[id] + (f==0 ? 0 : (int)BF3_DELTA[f-1][id]));
             frame_move_ms[f]  = BF3_MOVE_MS[f];
             frame_delay_ms[f] = BF3_DELAY_MS[f];
         }
@@ -1747,7 +1834,8 @@ static esp_err_t h_caltest(httpd_req_t*r){
 static void load_bf3(void){
     int nf = BF3_FRAMES < MAX_FRAMES ? BF3_FRAMES : MAX_FRAMES;
     for(int f=0; f<nf; f++){
-        for(int id=1; id<=12; id++) rec_frames[f][id] = BF3_SCS[f][id];
+        for(int id=1; id<=12; id++)
+            rec_frames[f][id] = (uint16_t)((int)BF3_REF[id] + (f==0 ? 0 : (int)BF3_DELTA[f-1][id]));
         frame_move_ms[f]  = BF3_MOVE_MS[f];
         frame_delay_ms[f] = BF3_DELAY_MS[f];
     }

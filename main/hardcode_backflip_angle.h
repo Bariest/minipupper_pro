@@ -1,16 +1,18 @@
 // hardcode_backflip_angle.h  --  "Backflip 3"
 //
 // 7 hand-taught keyframes captured via teach / rec, then hardcoded here so they
-// survive a reflash without needing NVS. Stored as RAW servo command SCS
-// (0..1023), servo id order 1..12: FR abd/hip/knee, FL, RR, RL. Index [0] of
-// each row is unused (kept so the table lines up with rec_frames[f][1..12]).
+// survive a reflash without needing NVS.
 //
-// Unlike mp2_backflip_data.h / mp2_backflip2_data.h (which store URDF degrees
-// and remap through BF_SIGN[]/BF_STAND[]/offset[]), these values are already in
-// the final command convention that the trace buffer uses, so bfload3 copies
-// them straight in -- no sign/stand/offset remap. That reproduces the EXACT
-// physical pose that was taught, as long as the per-servo calibration is
-// unchanged from when they were recorded.
+// DESIGN (calibration-safe):
+//   BF3_REF[]      = reference pose (frame 0), stored as absolute SCS (0..1023)
+//   BF3_DELTA[][]  = all subsequent frames as RELATIVE offsets from BF3_REF
+//
+//   At load time (bfload3 / bf3) the code computes:
+//     rec_frames[f][id] = BF3_REF[id] + BF3_DELTA[f-1][id]
+//
+//   After recalibration you only need to update BF3_REF[] (re-teach the start
+//   pose), and all frames automatically shift because the deltas stay the same
+//   — they represent the RELATIVE joint motion, not absolute positions.
 //
 // Sequence: frame 0 is the start pose; frames 1..5 are the flip; frame 6
 // returns to the same start pose, so it begins and ends in the same stance.
@@ -21,9 +23,8 @@
 #pragma once
 #include <stdint.h>
 
-#define BF3_FRAMES 7
+#define BF3_FRAMES 10
 
-//good old with old calibration values
 // static const uint16_t BF3_SCS[BF3_FRAMES][13] = {
 //     /* idx      1    2    3    4    5    6    7    8    9   10   11   12 */
 //     {   0,     53,514,332,976,451,735,41,683,289,334,426,716}, /* 0 start */
@@ -37,28 +38,46 @@
 //     //{   0,     51,427,520,60,593,568,62,615,714,970,527,566 }, /* 6 end (= start) */
 // };
 
+// ---- REFERENCE POSE (frame 0) ----
+// Absolute SCS values for the starting stance. Update these after recalibration
+// to match the new centre/neutral pose. Index [0] is unused.
+static const uint16_t BF3_REF[13] = {
+    /* idx  1     2    3    4    5    6    7    8    9   10   11   12 */
+           1023,  642,  507, 1023,  349,  742, 1023,  695,  576,  491,  346,  800
+};
 
+// ---- DELTA FRAMES (frames 1..6, relative to BF3_REF) --------------------
+// Each row is the signed offset from BF3_REF. int16_t so negative values work.
+// After recalibration these do NOT change — they store the RELATIVE motion.
+// Index [0] of each row is unused.
+static const int16_t BF3_DELTA[BF3_FRAMES - 1][13] = {
+    /* frame 0 — crouch (same as ref) */
+    {0, 0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0,    0},
+
+     /* frame 1 — crouch (same as ref) */
+    {0,     0,  -178,   -15,     0,   194,    17,     0,   -52,   159,  -108,    48,  -160},
+    
+    /* frame 2 — front leg lifting */
+    {0, 1023,  610,  680, 1023,  404,  527, 1023,  570,  711,  478,  391,  644},
+    /* frame 3 — back leg rotating */
+    {0, 0,  105,  119,    0, -141, -208,    0, -161,  243,    7,   69, -297},
+    /* frame 4 — back leg pushing */
+    {0, 0,  104,  117,    0, -142, -208,    0,  -58,  328,   41,   49, -398},
+    /* frame 5 — retract front leg */
+    {0, 0,  200, -170,    0, -145,  165,    0,  -66,  309,   37,   43, -398},
+    /* frame 6 — back leg retracting and front leg landing */
+    {0, 0,  197, -169,    0, -146,  164,    0,   66, -123,   -2,   20,   20},
+};
 
 // ---- PER-FRAME TIMING (edit these freely) --------------------------------
-// One value per frame, so every transition can have its own speed and its own
-// pause. Both are in milliseconds.
-//   BF3_MOVE_MS[f]  = time to MOVE into frame f from the previous pose.
-//                     Lower = faster snap. (Frame 0 = time to reach the start
-//                     pose from the neutral stand.)
-//   BF3_DELAY_MS[f] = time to HOLD/DWELL on frame f after arriving, before
-//                     moving on to the next frame. 0 = no pause.
-//
-// Example below: ease into the start (frame 0), snap through the flip poses
-// (frames 1-4) fast with no pause, brief hold at frame 5, then settle back to
-// the start pose (frame 6). Tune each number to taste.
+// BF3_MOVE_MS[f]  = time to MOVE into frame f from the previous pose.
+// BF3_DELAY_MS[f] = time to HOLD/DWELL on frame f after arriving.
+static const int BF3_MOVE_MS[BF3_FRAMES]  = {1000, 1000, 1000, 1000, 1000, 1000, 1000};
+static const int BF3_DELAY_MS[BF3_FRAMES] = { 500,  500,  500,  500,  500,  500};
 
-//Good - old config
-//move_ms[a]: from frame a-1 to frame a 
+
+// //move_ms[a]: from frame a-1 to frame a 
 // static const int BF3_MOVE_MS[BF3_FRAMES]  = {  500,  250,   50,  50,  50,  100,  250};
 // //delay_ms[a]: after frame executing frame a, stay ...ms before moving to the frame a+1 
 // static const int BF3_DELAY_MS[BF3_FRAMES] = {  500,   1000,  5,    20,    30,   150};
 
-//move_ms[a]: from frame a-1 to frame a 
-// static const int BF3_MOVE_MS[BF3_FRAMES]  = {  500,  250,   50,  50,  50,  100,  250};
-// //delay_ms[a]: after frame executing frame a, stay ...ms before moving to the frame a+1 
-// static const int BF3_DELAY_MS[BF3_FRAMES] = {  500,   1000,  10,    70,    30,   150};
