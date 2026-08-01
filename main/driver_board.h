@@ -249,10 +249,13 @@ enum {
     DB_LIVE_PWM_DUTY,           /* PWM duty cycle 0..1          */
     DB_LIVE_MODE,               /* 0 idle 1 position 2 torque   */
     DB_LIVE_LOOP_COUNTER,       /* control loop tick counter    */
+    DB_LIVE_NTC_ADC,            /* board-channel NTC, raw ADC   */
     DB_LIVE_COUNT
 };
 
 bool driver_board_get_live(int servo /*1..12*/, int live_id, float *out);
+bool driver_board_get_ntc_adc(int servo /*1..12*/, float *out);
+bool driver_board_get_temperature_c(int servo /*1..12*/, float *out);
 
 #ifdef __cplusplus
 }

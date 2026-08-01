@@ -255,6 +255,7 @@ static void cli_exec(char *cmd){
                    "  <id 1-12> tor <current_mA>   torque mode, +/- direction\n"
                    "  <id 1-12> stop               idle, motor off\n"
                    "  <id 1-12> fb                 present position + current\n"
+                   "  <id 1-12> temp               NTC board temperature (raw ADC + °C)\n"
                    "  dump              all 12 servos\n"
                    "  trace <id>        live position/current view (trace off = stop)\n"
                    "  sweep [id low high hold_ms cycles hz]  PID step test -> CSV\n"
@@ -347,6 +348,17 @@ static void cli_exec(char *cmd){
             cli_printf("%2d present: pos=%u (SCS 0-1023), cur=%d mA\n",
                        id, driver_board_present_position(id),
                        driver_board_present_current(id));
+
+        }else if(!strcmp(t1,"temp")){
+            float adc, degC;
+            bool ok_ntc = driver_board_get_ntc_adc(id, &adc);
+            bool ok_deg = driver_board_get_temperature_c(id, &degC);
+            if(ok_ntc && ok_deg)
+                cli_printf("%2d NTC: raw ADC %5.0f  temperature %.1f °C\n", id, adc, degC);
+            else if(ok_ntc)
+                cli_printf("%2d NTC: raw ADC %5.0f  temperature: out of range\n", id, adc);
+            else
+                cli_printf("temp FAILED (no reply from board)\n");
 
         }else if(!strcmp(t1,"get") || !strcmp(t1,"set")){
             char *t2 = strtok_r(NULL," \t",&sp);
@@ -645,6 +657,21 @@ static void serial_handle_line(char *line){
     }
     // Capture the CURRENT servo positions as the stand calibration. Pose the
     // robot in its normal stance first (e.g. via teach), then run 'calhere'.
+    // Read NTC temperature from a servo's driver board (serial CLI).
+    // Usage: temp <id>  (needs 'cli on' to own the SPI bus)
+    if(!strncmp(line,"temp",4) && (line[4]==' ' || line[4]=='\t')){
+        if(!CliMode){ printf("run 'cli on' first\n"); return; }
+        int id = atoi(line+5);
+        if(id<1 || id>12){ printf("usage: temp <id 1-12>\n"); return; }
+        float adc, degC;
+        if(driver_board_get_ntc_adc(id, &adc) && driver_board_get_temperature_c(id, &degC))
+            printf("%2d NTC: raw ADC %5.0f  temperature %.1f °C\n", id, adc, degC);
+        else if(driver_board_get_ntc_adc(id, &adc))
+            printf("%2d NTC: raw ADC %5.0f  temperature: out of range\n", id, adc);
+        else
+            printf("temp: SPI read failed (board not responding?)\n");
+        return;
+    }
     if(!strcmp(line,"calhere")){
         printf("calhere: capturing present positions as the stand ->\n");
         for(int i=1;i<=12;i++){

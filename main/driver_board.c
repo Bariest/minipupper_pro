@@ -8,6 +8,7 @@
  */
 #include "driver_board.h"
 
+#include <math.h>
 #include <string.h>
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
@@ -31,6 +32,12 @@
 #define START_FIELD  0xA5A5
 #define MODE_FIELD   0x0001
 #define MODE_POSITION 0x0001   /* AT32: position control, "torque" field = max current mA */
+
+#define NTC_PULLUP_RESISTANCE_OHM  10000.0f
+#define NTC_NOMINAL_RESISTANCE_OHM 10000.0f
+#define NTC_NOMINAL_TEMPERATURE_K  298.15f
+#define NTC_BETA_K                 3380.0f
+#define NTC_ADC_FULL_SCALE          4095.0f
 
 #pragma pack(push,1)
 typedef struct { uint16_t mode, position; int16_t torque; uint16_t kp, kd; } servo_cmd_sub_t;
@@ -61,13 +68,17 @@ static esp_err_t spi_xfer(uint8_t board, uint8_t size, uint8_t *tx, uint8_t *rx)
     t.length    = (size_t)size * 8;
     t.tx_buffer = tx;
     t.rx_buffer = rx;
+    esp_err_t ret;
     switch (board) {
-        case 0: return spi_device_transmit(dev_right_front, &t); /* servos 1-3  FR */
-        case 1: return spi_device_transmit(dev_left_front,  &t); /* servos 4-6  FL */
-        case 2: return spi_device_transmit(dev_right_rear,  &t); /* servos 7-9  RR */
-        case 3: return spi_device_transmit(dev_left_rear,   &t); /* servos 10-12 RL */
-        default: return ESP_FAIL;
+        case 0: ret = spi_device_transmit(dev_right_front, &t); break; /* servos 1-3  FR */
+        case 1: ret = spi_device_transmit(dev_left_front,  &t); break; /* servos 4-6  FL */
+        case 2: ret = spi_device_transmit(dev_right_rear,  &t); break; /* servos 7-9  RR */
+        case 3: ret = spi_device_transmit(dev_left_rear,   &t); break; /* servos 10-12 RL */
+        default: ret = ESP_FAIL; break;
     }
+    if (ret != ESP_OK)
+        ESP_LOGW(TAG, "SPI xfer FAILED board %d size %d err 0x%x", board, size, ret);
+    return ret;
 }
 
 void driver_board_power(bool on)
@@ -101,10 +112,10 @@ void driver_board_init(void)
 
     /* 4 driver-board devices (12 MHz, mode 0) */
     spi_device_interface_config_t dev = {
-        .mode           = 0,
-        .duty_cycle_pos = 128,
-        .clock_speed_hz = 12 * 1000 * 1000,   /* 15 MHz (15 MHz max) */
-        .queue_size     = 2,
+        .mode             = 0,
+        .duty_cycle_pos   = 128,
+        .clock_speed_hz   = 12 * 1000 * 1000,   /* 12 MHz */
+        .queue_size       = 2,
     };
     dev.spics_io_num = SPI_MASTER_CS0; ESP_ERROR_CHECK(spi_bus_add_device(SPI_MASTER_ID, &dev, &dev_left_front));
     dev.spics_io_num = SPI_MASTER_CS1; ESP_ERROR_CHECK(spi_bus_add_device(SPI_MASTER_ID, &dev, &dev_right_front));
@@ -112,7 +123,18 @@ void driver_board_init(void)
     dev.spics_io_num = SPI_MASTER_CS3; ESP_ERROR_CHECK(spi_bus_add_device(SPI_MASTER_ID, &dev, &dev_right_rear));
 
     driver_board_power(true);
-    ESP_LOGI(TAG, "driver board SPI init OK (4 boards, 12 servos)");
+    ESP_LOGI(TAG, "SPI init OK (4 boards, 12 servos). Probing boards...");
+    /* quick poll: try to read one param from each board to see who answers */
+    for (int b = 0; b < 4; b++) {
+        int id = b * 3 + 1;
+        float v;
+        if (driver_board_get_param(id, DB_PARAM_KP_POSITION, &v))
+            ESP_LOGI(TAG, "board %d (CS%d): ALIVE (kp_position=%g)", b,
+                     (int[]){10,9,14,21}[b], v);
+        else
+            ESP_LOGW(TAG, "board %d (CS%d): NO RESPONSE -- check wiring / AT32 firmware", b,
+                     (int[]){10,9,14,21}[b]);
+    }
 }
 
 void driver_board_sync_write(const uint16_t pos[12], const uint16_t cur_mA[12])
@@ -216,8 +238,23 @@ static bool cfg_request(uint8_t board, uint16_t op, uint16_t servo_index,
     if (!cfg_xfer(board, op, servo_index, param_id, value, NULL)) return false;
     esp_rom_delay_us(500);                       /* let the AT32 IRQ run   */
     if (!cfg_xfer(board, CFG_OP_NOP, 0, 0, 0, &rx)) return false;
-    if (rx.status != START_CONFIG) return false; /* not a config response  */
-    if (rx.s1.position != param_id) return false;/* echo mismatch          */
+
+    /* Log raw response so we can see where the AT32 puts 0xC0DE */
+    ESP_LOGI(TAG, "cfg_resp board %d op %d: start=0x%04X status=0x%04X "
+             "s1.st=0x%04X s1.pos=%d s1.tor=%d s1.res=0x%08lX chk=0x%04X",
+             board, op, rx.start, rx.status,
+             rx.s1.status, rx.s1.position, rx.s1.torque,
+             (unsigned long)rx.s1.res, rx.check_sum);
+
+    if (rx.status != START_CONFIG && rx.start != START_CONFIG) {
+        ESP_LOGW(TAG, "cfg_req board %d op %d: no 0xC0DE in start or status", board, op);
+        return false;
+    }
+    if (rx.s1.position != param_id) {
+        ESP_LOGW(TAG, "cfg_req board %d op %d: echo mismatch got %d expected %d",
+                 board, op, rx.s1.position, param_id);
+        return false;
+    }
     if (out) memcpy(out, &rx.s1.res, sizeof(float));
     return true;
 }
@@ -250,6 +287,29 @@ bool driver_board_get_live(int servo, int live_id, float *out)
     return cfg_request((uint8_t)(p / 3), CFG_OP_GET_LIVE,
                        (uint16_t)(p % 3), (uint16_t)live_id,
                        0, out);
+}
+
+bool driver_board_get_ntc_adc(int servo, float *out)
+{
+    return driver_board_get_live(servo, DB_LIVE_NTC_ADC, out);
+}
+
+bool driver_board_get_temperature_c(int servo, float *out)
+{
+    float adc;
+    float resistance;
+
+    if (out == NULL || !driver_board_get_ntc_adc(servo, &adc))
+        return false;
+    if (adc <= 0.0f || adc >= NTC_ADC_FULL_SCALE)
+        return false;
+
+    resistance = NTC_PULLUP_RESISTANCE_OHM * adc /
+                 (NTC_ADC_FULL_SCALE - adc);
+    *out = (1.0f / ((1.0f / NTC_NOMINAL_TEMPERATURE_K) +
+            (logf(resistance / NTC_NOMINAL_RESISTANCE_OHM) / NTC_BETA_K))) -
+           273.15f;
+    return true;
 }
 
 static bool cfg_board_op(int board, uint16_t op)
