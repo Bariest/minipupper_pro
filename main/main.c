@@ -820,6 +820,36 @@ static void serial_handle_line(char *line){
         printf("backflip 3: playing %d frames with per-frame timing\n", nf);
         return;
     }
+    // ---- "Backflip 4": same data source as Backflip 3 (hardcode_backflip_angle.h),
+    // but a separate command so you can maintain two variants.
+    if(!strcmp(line,"bfload4")){
+        reset_all_modes();
+        int nf = BF3_FRAMES < MAX_FRAMES ? BF3_FRAMES : MAX_FRAMES;
+        for(int f=0; f<nf; f++){
+            for(int id=1; id<=12; id++)
+                rec_frames[f][id] = (uint16_t)((int)BF3_REF[id] + (f==0 ? 0 : (int)BF3_DELTA[f-1][id]));
+            frame_move_ms[f]  = BF3_MOVE_MS[f];
+            frame_delay_ms[f] = BF3_DELAY_MS[f];
+        }
+        rec_count = nf; verify_idx = 0; use_frame_timing = 1;
+        printf("bfload4: %d backflip-4 frames -> trace (per-frame timing). "
+               "Use Verify </>, 'verify N', or 'play'.\n", nf);
+        return;
+    }
+    if(!strcmp(line,"bf4")){
+        reset_all_modes();
+        int nf = BF3_FRAMES < MAX_FRAMES ? BF3_FRAMES : MAX_FRAMES;
+        for(int f=0; f<nf; f++){
+            for(int id=1; id<=12; id++)
+                rec_frames[f][id] = (uint16_t)((int)BF3_REF[id] + (f==0 ? 0 : (int)BF3_DELTA[f-1][id]));
+            frame_move_ms[f]  = BF3_MOVE_MS[f];
+            frame_delay_ms[f] = BF3_DELAY_MS[f];
+        }
+        rec_count = nf; verify_idx = 0; use_frame_timing = 1;
+        started_once=1; Play=1;
+        printf("backflip 4: playing %d frames with per-frame timing\n", nf);
+        return;
+    }
     int psp;
     if(sscanf(line,"pspeed %d",&psp)==1){
         if(psp<100)  psp=100;
@@ -1516,6 +1546,12 @@ static esp_err_t send_root(httpd_req_t *req){
       "<a href=\"/bfload3\" style=\"color:white;\">&#128260; Load backflip 3</a></button>"
       "<button class=\"twerk-btn %s\" type=\"button\" style=\"background:#27ae60;width:150px;\">"
       "<a href=\"/bf3\" style=\"color:white;\">&#9654; Play backflip 3</a></button></div>", ON(Play));
+    // Backflip 4: same data as Backflip 3, separate load + play buttons.
+    A("<div style=\"margin:6px auto;\">"
+      "<button type=\"button\" style=\"background:#8e44ad;color:white;width:150px;\">"
+      "<a href=\"/bfload4\" style=\"color:white;\">&#128260; Load backflip 4</a></button>"
+      "<button class=\"twerk-btn %s\" type=\"button\" style=\"background:#9b59b6;width:150px;\">"
+      "<a href=\"/bf4\" style=\"color:white;\">&#9654; Play backflip 4</a></button></div>", ON(Play));
     // Calibration test: lift one leg at a time (FL, FR, BL, BR).
     A("<div style=\"margin:6px auto;\">"
       "<button type=\"button\" style=\"background:#e67e22;color:white;width:210px;\">"
@@ -1845,6 +1881,19 @@ static void load_bf3(void){
 static esp_err_t h_bfload3(httpd_req_t*r){ reset_all_modes(); load_bf3(); return send_root(r); }
 // Web: load Backflip 3 and play it immediately with its per-frame timing.
 static esp_err_t h_bf3(httpd_req_t*r){ reset_all_modes(); load_bf3(); started_once=1; Play=1; return send_root(r); }
+// Backflip 4: same data source as Backflip 3, separate load + play helpers.
+static void load_bf4(void){
+    int nf = BF3_FRAMES < MAX_FRAMES ? BF3_FRAMES : MAX_FRAMES;
+    for(int f=0; f<nf; f++){
+        for(int id=1; id<=12; id++)
+            rec_frames[f][id] = (uint16_t)((int)BF3_REF[id] + (f==0 ? 0 : (int)BF3_DELTA[f-1][id]));
+        frame_move_ms[f]  = BF3_MOVE_MS[f];
+        frame_delay_ms[f] = BF3_DELAY_MS[f];
+    }
+    rec_count = nf; verify_idx = 0; use_frame_timing = 1;
+}
+static esp_err_t h_bfload4(httpd_req_t*r){ reset_all_modes(); load_bf4(); return send_root(r); }
+static esp_err_t h_bf4(httpd_req_t*r){ reset_all_modes(); load_bf4(); started_once=1; Play=1; return send_root(r); }
 static esp_err_t h_pspM(httpd_req_t*r){ if(play_ms>100){ play_ms-=100; nvs_put_int("play_ms",play_ms);} return send_root(r); }
 static esp_err_t h_pspP(httpd_req_t*r){ if(play_ms<3000){ play_ms+=100; nvs_put_int("play_ms",play_ms);} return send_root(r); }
 // Dwell/hold at each pose before moving to the next (ms). 0 = no pause.
@@ -2239,6 +2288,7 @@ static void start_webserver(void){
     reg(s,"/bfload",h_bfload);
     reg(s,"/bfload2",h_bfload2);
     reg(s,"/bfload3",h_bfload3);   reg(s,"/bf3",h_bf3);
+    reg(s,"/bfload4",h_bfload4);   reg(s,"/bf4",h_bf4);
     reg(s,"/caltest",h_caltest);
     reg(s,"/pos",h_pos);           // live servo positions (CSV) for teach_live.py
     reg(s,"/pspM",h_pspM);         reg(s,"/pspP",h_pspP);
@@ -2412,9 +2462,21 @@ static void gait_task(void *arg){
             // the stance pose at the end and hold there.
             cur_override_mA = 0;
             uint16_t ini[13]; fill_ini_frame(ini);
-            interp_to(ini, play_ms, &Play);      // "all start from initial position"
-            for(int f=0; f<rec_count && Play; f++){
-                // per-frame timing (Backflip 3) if loaded, else the globals
+            if(use_frame_timing){
+                // Backflip 3/4 (per-frame timing): start from the reference
+                // frame (frame 0 = BF3_REF) instead of ini, so the robot
+                // establishes the reference pose FIRST, then plays the delta
+                // frames (1..N) on top of it.
+                int mv0 = frame_move_ms[0] > 0 ? frame_move_ms[0] : play_ms;
+                int dl0 = frame_delay_ms[0] >= 0 ? frame_delay_ms[0] : play_delay_ms;
+                if(mv0 < 1) mv0 = 1;
+                interp_to(rec_frames[0], mv0, &Play);
+                dwell_ms(dl0, &Play);
+            } else {
+                interp_to(ini, play_ms, &Play);      // "all start from initial position"
+            }
+            for(int f=(use_frame_timing?1:0); f<rec_count && Play; f++){
+                // per-frame timing (Backflip 3/4) if loaded, else the globals
                 int mv = use_frame_timing ? frame_move_ms[f]  : play_ms;
                 int dl = use_frame_timing ? frame_delay_ms[f] : play_delay_ms;
                 if(mv < 1) mv = 1;
