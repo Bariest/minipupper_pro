@@ -31,6 +31,7 @@
 #include "mp2_backflip2_data.h"  // hand-crafted backflip keyframes (backflip_edit.py)
 #include "mp2_caltest_data.h"    // calibration test: lift one leg at a time
 #include "hardcode_backflip_angle.h" // "Backflip 3": hand-taught SCS keyframes
+#include "hdf5_traj1.h"          // HDF5 trajectory #1: delta-format, auto-generated
 
 #define TAG "PUPPER"
 #define PI 3.14159265358979f
@@ -118,7 +119,7 @@ static float     manual_ovr_deg[13] = {0};  // angle in degrees (0-270)
  * Mirror is the optional optimizer: copy the RIGHT legs onto the LEFT (same
  * foot height, mirrored joint angles). The trace can be saved to flash (NVS)
  * so the recorded angles survive a reboot ("hardcoded"). */
-#define MAX_FRAMES   32
+#define MAX_FRAMES   128
 static int teach_cur = 50;       /* teach-mode current cap (mA); lower = limper */
 static uint16_t rec_frames[MAX_FRAMES][13];  /* [frame][servo 1..12] SCS 0..1023 */
 static int rec_count   = 0;      /* number of recorded keyframes                */
@@ -1552,6 +1553,12 @@ static esp_err_t send_root(httpd_req_t *req){
       "<a href=\"/bfload4\" style=\"color:white;\">&#128260; Load backflip 4</a></button>"
       "<button class=\"twerk-btn %s\" type=\"button\" style=\"background:#9b59b6;width:150px;\">"
       "<a href=\"/bf4\" style=\"color:white;\">&#9654; Play backflip 4</a></button></div>", ON(Play));
+    // HDF5 Trajectory #1: delta-format (auto-generated from bfv1.hdf5).
+    A("<div style=\"margin:6px auto;\">"
+      "<button type=\"button\" style=\"background:#2980b9;color:white;width:150px;\">"
+      "<a href=\"/hdf5traj1load\" style=\"color:white;\">&#128194; Load HDF5 Traj 1</a></button>"
+      "<button class=\"twerk-btn %s\" type=\"button\" style=\"background:#3498db;width:150px;\">"
+      "<a href=\"/hdf5traj1play\" style=\"color:white;\">&#9654; Play HDF5 Traj 1</a></button></div>", ON(Play));
     // Calibration test: lift one leg at a time (FL, FR, BL, BR).
     A("<div style=\"margin:6px auto;\">"
       "<button type=\"button\" style=\"background:#e67e22;color:white;width:210px;\">"
@@ -1894,6 +1901,19 @@ static void load_bf4(void){
 }
 static esp_err_t h_bfload4(httpd_req_t*r){ reset_all_modes(); load_bf4(); return send_root(r); }
 static esp_err_t h_bf4(httpd_req_t*r){ reset_all_modes(); load_bf4(); started_once=1; Play=1; return send_root(r); }
+// ---- HDF5 Trajectory #1 (delta-format, auto-generated from bfv1.hdf5) ----
+static void load_hdf5_traj1(void){
+    int nf = HDF5_TRAJ1_FRAMES < MAX_FRAMES ? HDF5_TRAJ1_FRAMES : MAX_FRAMES;
+    for(int f=0; f<nf; f++){
+        for(int id=1; id<=12; id++)
+            rec_frames[f][id] = (uint16_t)((int)HDF5_TRAJ1_REF[id] + (f==0 ? 0 : (int)HDF5_TRAJ1_DELTA[f-1][id]));
+        frame_move_ms[f]  = HDF5_TRAJ1_MOVE_MS[f];
+        frame_delay_ms[f] = HDF5_TRAJ1_DELAY_MS[f];
+    }
+    rec_count = nf; verify_idx = 0; use_frame_timing = 1;
+}
+static esp_err_t h_hdf5traj1load(httpd_req_t*r){ reset_all_modes(); load_hdf5_traj1(); return send_root(r); }
+static esp_err_t h_hdf5traj1play(httpd_req_t*r){ reset_all_modes(); load_hdf5_traj1(); started_once=1; Play=1; return send_root(r); }
 static esp_err_t h_pspM(httpd_req_t*r){ if(play_ms>100){ play_ms-=100; nvs_put_int("play_ms",play_ms);} return send_root(r); }
 static esp_err_t h_pspP(httpd_req_t*r){ if(play_ms<3000){ play_ms+=100; nvs_put_int("play_ms",play_ms);} return send_root(r); }
 // Dwell/hold at each pose before moving to the next (ms). 0 = no pause.
@@ -2289,6 +2309,7 @@ static void start_webserver(void){
     reg(s,"/bfload2",h_bfload2);
     reg(s,"/bfload3",h_bfload3);   reg(s,"/bf3",h_bf3);
     reg(s,"/bfload4",h_bfload4);   reg(s,"/bf4",h_bf4);
+    reg(s,"/hdf5traj1load",h_hdf5traj1load); reg(s,"/hdf5traj1play",h_hdf5traj1play);
     reg(s,"/caltest",h_caltest);
     reg(s,"/pos",h_pos);           // live servo positions (CSV) for teach_live.py
     reg(s,"/pspM",h_pspM);         reg(s,"/pspP",h_pspP);
