@@ -7,8 +7,9 @@ Two variants are auto-detected by q.shape[1]:
 
   14-DOF (Mini Pupper reduced — hips locked out):
     q: (n, 14)  [base_x, base_y, base_z, MRP_x, MRP_y, MRP_z,
-                 FR_HFE, FR_KFE, FL_HFE, FL_KFE,
-                 HR_HFE, HR_KFE, HL_HFE, HL_KFE]
+                 FR_HFE, FR_KFE, HR_HFE, HR_KFE,
+                 FL_HFE, FL_KFE, HL_HFE, HL_KFE]
+                 ^ SIDE-MAJOR (right side, then left side) — NOT FR,FL,HR,HL
     v: (n, 14)  tau: (n, 8)
 
   18-DOF (Solo12 full model):
@@ -65,20 +66,28 @@ from typing import Tuple, Optional, Dict, Any
 
 # Mapping tables keyed by q.shape[1]:
 #   ESP32 column → (HDF5 q index or None for abduction)
+# NOTE (fixed): the 14-DOF Mini Pupper files are SIDE-MAJOR, not front-major.
+# The actual q[6:14] order is:
+#     FR_HFE, FR_KFE,  RR_HFE, RR_KFE,  FL_HFE, FL_KFE,  RL_HFE, RL_KFE
+# i.e. (front, rear) of one side, then (front, rear) of the other side.
+# Verified empirically: in a sagittally-symmetric backflip, q[6:8] == q[10:12]
+# and q[8:10] == q[12:14] — which only holds if slots 0/2 are the same END of
+# the robot mirrored L/R, not the same SIDE.  The old map sent the REAR-leg
+# trajectory to FL and the FRONT-leg trajectory to RR.
 _Q_INDEX_MAP_BY_DIM = {
-    14: [None, 6, 7,   None, 8, 9,   None, 10, 11,   None, 12, 13],
+    14: [None, 6, 7,   None, 10, 11,   None, 8, 9,   None, 12, 13],
     18: [None, 7, 8,   None, 10, 11,  None, 13, 14,   None, 16, 17],
 }
 
 # Velocity index maps (same shape as q for the reduced model)
 _V_INDEX_MAP_BY_DIM = {
-    14: [None, 6, 7,   None, 8, 9,   None, 10, 11,   None, 12, 13],
+    14: [None, 6, 7,   None, 10, 11,   None, 8, 9,   None, 12, 13],
     18: [None, 7, 8,   None, 10, 11,  None, 13, 14,   None, 16, 17],
 }
 
-# Torque index maps (tau has only actuated joint dims)
+# Torque index maps (tau has only actuated joint dims, same leg order as q)
 _TAU_INDEX_MAP_BY_DIM = {
-    8:  [None, 0, 1,   None, 2, 3,   None, 4, 5,   None, 6, 7],
+    8:  [None, 0, 1,   None, 4, 5,   None, 2, 3,   None, 6, 7],
     12: [None, 1, 2,   None, 4, 5,   None, 7, 8,   None, 10, 11],
 }
 
@@ -87,6 +96,45 @@ BF_STAND = np.array([0, -90, 45, 0, -90, 45, 0, -90, 45, 0, -90, 45],
                      dtype=np.float64)
 BF_SIGN  = np.array([+1, +1, +1, +1, -1, -1, +1, +1, +1, +1, -1, -1],
                      dtype=np.float64)
+
+# ---------------------------------------------------------------------------
+# KNEE CONVENTION — parallel-linkage coupling
+#
+# The optimizer's URDF is a plain SERIAL two-link chain, so KFE is the knee
+# angle measured RELATIVE TO THE THIGH (i.e. -(pi - beta), the bend).
+#
+# The Mini Pupper's lower-leg servo is body-mounted and drives the calf through
+# a parallel linkage, so it commands the calf's ABSOLUTE orientation, in the
+# same angular sense and from the same datum as the hip servo. This is exactly
+# what the firmware's IK produces:
+#     stanford_kinematics.c:  knee_angle = hip_angle - (M_PI - beta)
+#
+# Therefore:  servo_knee_deg  =  HFE + KFE     (absolute calf angle)
+#
+# Verified against frame 0 of the trajectories:
+#     HFE = +56.95, KFE = -101.24  ->  implied leg length 70.2 mm
+#         (== SK_NEUTRAL_HEIGHT_MM / NEUTRAL_Z = 70)
+#     HFE + KFE = -44.29  ->  |.| = 44.3 == BF_STAND knee datum of 45
+#   The relative bend (101.2 deg) matches nothing in the calibration; the
+#   absolute calf angle matches it to 0.7 deg. The firmware is absolute.
+#
+# Feeding the raw relative KFE straight through leaves the hip correct but the
+# calf wrong on ALL FOUR legs, because it drops the +HFE coupling term.
+# ---------------------------------------------------------------------------
+KNEE_ABSOLUTE = True          # module default; override per call if needed
+_KNEE_COLS = (2, 5, 8, 11)    # KFE columns in the 12-col ESP32 order
+_HIP_COLS  = (1, 4, 7, 10)    # matching HFE columns
+
+
+def couple_knee_to_hip(angles_deg: np.ndarray) -> np.ndarray:
+    """Convert serial-chain URDF knee angles to ABSOLUTE calf angles.
+
+    knee_abs = HFE + KFE, applied to all four legs. Accepts (n, 12) or (12,).
+    """
+    a = np.atleast_2d(np.array(angles_deg, dtype=np.float64, copy=True))
+    for hip, knee in zip(_HIP_COLS, _KNEE_COLS):
+        a[:, knee] = a[:, hip] + a[:, knee]
+    return a.reshape(np.shape(angles_deg))
 
 # ---------------------------------------------------------------------------
 # Leg / joint name helpers
@@ -135,9 +183,14 @@ def _get_tau_dim(data: Dict[str, np.ndarray]) -> int:
     return 8  # default for Mini Pupper
 
 
-def extract_joint_angles_deg(data: Dict[str, np.ndarray]) -> np.ndarray:
+def extract_joint_angles_deg(data: Dict[str, np.ndarray],
+                             couple_knee: Optional[bool] = None) -> np.ndarray:
     """Extract joint angles from HDF5 data, returning (n_knots, 12) in
     URDF degrees with abduction columns set to 0.0.
+
+    If ``couple_knee`` (default: KNEE_ABSOLUTE) the KFE columns are converted
+    from the URDF's thigh-relative angle to the ABSOLUTE calf angle the
+    parallel-linkage knee servo actually commands (see couple_knee_to_hip).
 
     Auto-detects the HDF5 format from q.shape[1]:
       14 = Mini Pupper reduced (hips locked)
@@ -169,6 +222,9 @@ def extract_joint_angles_deg(data: Dict[str, np.ndarray]) -> np.ndarray:
         if q_idx is not None:
             angles_deg[:, col] = np.rad2deg(q[:, q_idx])
         # else: stays 0.0 (abduction)
+
+    if KNEE_ABSOLUTE if couple_knee is None else couple_knee:
+        angles_deg = couple_knee_to_hip(angles_deg)
 
     return angles_deg
 
