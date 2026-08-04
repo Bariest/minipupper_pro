@@ -14,8 +14,9 @@
 //   pose), and all frames automatically shift because the deltas stay the same
 //   — they represent the RELATIVE joint motion, not absolute positions.
 //
-// Sequence: frame 0 is the start pose; frames 1..5 are the flip; frame 6
-// returns to the same start pose, so it begins and ends in the same stance.
+// Sequence: frame 0 is BF3_REF (the start stance); frames 1..7 are the flip.
+// Play then interp_to()s back to the Ini pose on its own, so no return frame
+// is stored here.
 //
 // Play it with:  bfload3   then  play        (or the one-shot:  bf3 )
 // Tune motion with:  pspeed <ms>   (move time per pose, lower = faster)
@@ -23,7 +24,18 @@
 #pragma once
 #include <stdint.h>
 
-#define BF3_FRAMES 10
+// Total playback frames = 1 reference pose + 7 delta keyframes.
+//
+// WAS 10, which was wrong: BF3_DELTA only has 7 rows and the timing tables only
+// had 7 and 6 entries. C zero-fills the rest of a partially-initialized array,
+// so load_bf3() (which loops f < BF3_FRAMES) fed playback three phantom frames:
+//   f=7  -> the real landing keyframe, but with MOVE_MS 0 -> clamped to 1 ms
+//   f=8,9-> REF + {0} = the stance, slammed into twice at 1 ms each
+// Stepping with Verify </> never showed it, because Goto uses the global
+// play_ms (1000 ms) and ignores frame_move_ms[] entirely. Only Play read the
+// zero-padded tail. The arrays below are now unsized + _Static_assert'd so a
+// short table is a compile error instead of a silent slam.
+#define BF3_FRAMES 8
 
 // static const uint16_t BF3_SCS[BF3_FRAMES][13] = {
 //     /* idx      1    2    3    4    5    6    7    8    9   10   11   12 */
@@ -41,31 +53,43 @@
 // ---- REFERENCE POSE (frame 0) ----
 // Absolute SCS values for the starting stance. Update these after recalibration
 // to match the new centre/neutral pose. Index [0] is unused.
+// The leading 0 is the unused index [0]. It was MISSING — only 12 values were
+// listed for a [13] array, so every servo read its neighbour's value (servo 1
+// got 1023->511, servo 2 got 511->684, ...) and servo 12 got the zero-fill.
+// With BF3_DELTA[..][12] = -90 that made rec_frames[f][12] = -90, which the
+// (uint16_t) cast in load_bf3() turns into 65446. The DELTA rows below always
+// had their leading 0; only REF was short. `recdump_bf` in main.c printed it
+// this way — that has been fixed too.
 static const uint16_t BF3_REF[13] = {
-    /* idx  1     2    3    4    5    6    7    8    9   10   11   12 */
-           1023,  511,  684, 1023,  513,  671, 1023,  504,  731,  471,  512,  585
+    /* idx  0     1     2    3     4    5     6     7    8     9   10   11   12 */
+             0, 1023,  511,  684, 1023,  513,  671, 1023,  504,  731,  471,  512,  585
 };
+_Static_assert(sizeof(BF3_REF) / sizeof(BF3_REF[0]) == 13,
+               "BF3_REF needs 13 entries: unused [0] + servos 1..12");
 
 // ---- DELTA FRAMES (frames 1..6, relative to BF3_REF) --------------------
 // Each row is the signed offset from BF3_REF. int16_t so negative values work.
 // After recalibration these do NOT change — they store the RELATIVE motion.
 // Index [0] of each row is unused.
-static const int16_t BF3_DELTA[BF3_FRAMES - 1][13] = {
-    /* frame 0 —  (same as ref) */
+// NOTE: left unsized on purpose — the compiler counts the rows, and the
+// _Static_assert below fails the build if that count != BF3_FRAMES - 1.
+// Row i here is played as frame i+1 (frame 0 is BF3_REF itself).
+static const int16_t BF3_DELTA[][13] = {
+    /* frame 1 — settle onto the start stance */
     {0, 0,    -6,     0,     0,     0,     1,     0,   139,    51,   -35,  -116,   -90},
 
-     /* frame 1 — crouch (same as ref) */
+     /* frame 2 — crouch */
     {0,     0,   -58,   -70,     0,   -36,   142,     0,   132,    50,   -41,  -115,   -89},
     
-    /* frame 2 — front leg lifting */
+    /* frame 3 — front leg lifting */
     {0, 0,   162,    75,     0,  -159,   -64,     0,   132,    33,   105,  -116,   -10},
-    /* frame 3 — back leg rotating */
+    /* frame 4 — back leg rotating */
     {0, 0,   147,   103,     0,  -135,  -104,     0,  -104,   138,    89,    74,  -159},
-    /* frame 4 — back leg pushing */
+    /* frame 5 — back leg pushing */
     {0, 0,   152,   106,     0,   -94,   -76,     0,   -11,   277,    88,     8,  -283},
-    /* frame 5 — retract front leg */
+    /* frame 6 — retract front leg */
     {0, 0,   169,  -248,     0,  -192,   254,     0,   -23,   179,   104,    19,  -167},
-    /* frame 6 — back leg retracting and front leg landing */
+    /* frame 7 — back leg retracting and front leg landing */
     {0,  0,   164,  -267,     0,  -178,   284,     0,   173,  -119,   104,  -175,   127},
 };
 
@@ -77,8 +101,27 @@ static const int16_t BF3_DELTA[BF3_FRAMES - 1][13] = {
 //static const int BF3_DELAY_MS[BF3_FRAMES] = { 500,  500,  500,  500,  500,  500};
 
 
-// //move_ms[a]: from frame a-1 to frame a 
- static const int BF3_MOVE_MS[BF3_FRAMES]  = {  1000,  1000,   30,  50,  30,  100,  150};
-// //delay_ms[a]: after frame executing frame a, stay ...ms before moving to the frame a+1 
- static const int BF3_DELAY_MS[BF3_FRAMES] = {  500,   5000,  5,    20,    30,   150};
+// move_ms[a]  : time to travel from frame a-1 into frame a.
+//               move_ms[0] is the approach from the Ini pose into BF3_REF.
+// delay_ms[a] : dwell on frame a after arriving, before starting frame a+1.
+//
+// Both tables MUST have exactly BF3_FRAMES entries. Left unsized so the
+// _Static_assert below catches a short table at compile time.
+//
+//                                    f=  0     1    2   3   4    5    6    7
+ static const int BF3_MOVE_MS[]  = {  1000,  1000,  30, 50, 30, 100, 150, 150 };
+ static const int BF3_DELAY_MS[] = {   500,  5000,   5, 20, 30, 150,   0, 300 };
+//                                                                     ^^^  ^^^
+// The last MOVE_MS (150) and last two DELAY_MS (0, 300) were never written —
+// they used to fall off the end of the table and come back as 0, which
+// interp_to() clamps to 1 ms. 150 matches the neighbouring airborne frames and
+// 300 gives the landing time to settle before Play returns to the Ini stance.
+// Tune all three on the robot.
+
+_Static_assert(sizeof(BF3_DELTA)    / sizeof(BF3_DELTA[0])    == BF3_FRAMES - 1,
+               "BF3_DELTA row count must be BF3_FRAMES - 1");
+_Static_assert(sizeof(BF3_MOVE_MS)  / sizeof(BF3_MOVE_MS[0])  == BF3_FRAMES,
+               "BF3_MOVE_MS must have exactly BF3_FRAMES entries");
+_Static_assert(sizeof(BF3_DELAY_MS) / sizeof(BF3_DELAY_MS[0]) == BF3_FRAMES,
+               "BF3_DELAY_MS must have exactly BF3_FRAMES entries");
 

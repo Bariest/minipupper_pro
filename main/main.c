@@ -600,9 +600,12 @@ static void serial_handle_line(char *line){
         printf("#define BF3_FRAMES %d\n\n", bf_count);
         printf("// ---- REFERENCE POSE (frame 0) ----\n");
         printf("static const uint16_t BF3_REF[13] = {\n");
-        printf("    /* idx  1     2     3     4     5     6     7     8     9    10    11    12 */\n");
-        printf("           ");
-        for(int i=1;i<=12;i++) printf("%s%4u%s", i==1?"":" ", bf_ref[i], i<12?",":"");
+        printf("    /* idx  0     1     2     3     4     5     6     7     8     9    10    11    12 */\n");
+        /* The leading 0 is index [0], unused (1-based servo indexing). It used
+         * to be omitted, which left only 12 initialisers for a [13] array and
+         * shifted every servo down one slot. */
+        printf("             0,");
+        for(int i=1;i<=12;i++) printf(" %4u%s", bf_ref[i], i<12?",":"");
         printf("\n};\n\n");
         if(bf_count > 1){
             printf("// ---- DELTA FRAMES (frames 1..%d) ----\n", bf_count-1);
