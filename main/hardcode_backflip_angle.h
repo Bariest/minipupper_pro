@@ -109,8 +109,8 @@ static const int16_t BF3_DELTA[][13] = {
 // _Static_assert below catches a short table at compile time.
 //
 //                                    f=  0     1    2   3   4    5    6    7
- static const int BF3_MOVE_MS[]  = {  1000,  1000,  30, 50, 30, 100, 150, 150 };
- static const int BF3_DELAY_MS[] = {   500,  5000,   5, 20, 30, 150,   0, 300 };
+ static const int BF3_MOVE_MS[]  = {  1000,  1000,  45, 75, 45, 100, 150, 150 };
+ static const int BF3_DELAY_MS[] = {   500,  500,   45, 110, 90, 150,   0, 300 };
 //                                                                     ^^^  ^^^
 // The last MOVE_MS (150) and last two DELAY_MS (0, 300) were never written —
 // they used to fall off the end of the table and come back as 0, which
