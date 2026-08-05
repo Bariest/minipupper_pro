@@ -168,6 +168,11 @@ td.dim{color:var(--dim);}
      transition:filter .15s,transform .1s;box-shadow:0 3px 10px rgba(245,158,11,.3);}
 #setbtn:hover{filter:brightness(1.05);transform:translateY(-1px);}
 #setbtn:active{transform:translateY(0);}
+#setallbtn{margin:0 12px 10px;padding:8px 0;width:calc(100% - 24px);
+     background:var(--panel);color:#374151;border:1px solid var(--line2);
+     border-radius:9px;cursor:pointer;font-weight:700;font-size:12px;
+     transition:background .15s,border-color .15s;}
+#setallbtn:hover{background:var(--raise);border-color:var(--acc);color:var(--txt);}
 #edmsg{padding:0 12px 6px;font-size:11px;min-height:16px;}
 #edmsg.ok{color:var(--ok);} #edmsg.err{color:var(--bad);}
 .hint{color:var(--dim);font-size:10.5px;padding:0 12px 12px;line-height:1.5;}
@@ -199,6 +204,53 @@ td.dim{color:var(--dim);}
 #gwrap{flex:1;min-height:0;padding:10px;}
 #gcv{width:100%;height:100%;display:block;background:#fff;
      border:1px solid var(--line2);border-radius:10px;}
+/* ================= "Set All Servos" modal ================= */
+#saback{position:fixed;inset:0;background:rgba(16,24,40,.42);z-index:20;
+     display:none;align-items:center;justify-content:center;}
+#saback.show{display:flex;}
+#samodal{background:var(--panel);border-radius:16px;width:640px;max-width:94vw;
+     max-height:90vh;display:flex;flex-direction:column;overflow:hidden;
+     box-shadow:0 24px 60px rgba(16,24,40,.35);}
+#satop{background:var(--grad);color:#fff;padding:13px 18px;display:flex;
+     align-items:center;gap:10px;}
+#satop b{font-size:15px;font-weight:800;letter-spacing:.2px;}
+#satop small{opacity:.9;font-size:11px;}
+#saclose{margin-left:auto;background:rgba(255,255,255,.2);border:none;color:#fff;
+     width:26px;height:26px;border-radius:8px;cursor:pointer;font-size:15px;line-height:1;}
+#saclose:hover{background:rgba(255,255,255,.35);}
+#sabody{padding:12px 16px;overflow-y:auto;flex:1;}
+#satools{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:9px;}
+#satools button{background:var(--panel);border:1px solid var(--line2);border-radius:8px;
+     padding:5px 12px;cursor:pointer;font-size:11px;color:#374151;}
+#satools button:hover{background:var(--raise);border-color:var(--acc);}
+#satools .sp{margin-left:auto;font-size:11px;color:var(--mut);}
+table.sat{width:100%;border-collapse:collapse;font-size:12px;}
+table.sat th{text-align:left;font-size:9.5px;letter-spacing:1.1px;text-transform:uppercase;
+     color:var(--dim);font-weight:700;padding:5px 6px;border-bottom:1px solid var(--line2);}
+table.sat td{padding:4px 6px;border-bottom:1px solid var(--line);}
+table.sat tr.off td{opacity:.4;}
+table.sat td.nm{font-family:Consolas,monospace;color:#374151;}
+table.sat td.ad{font-family:Consolas,monospace;color:var(--dim);width:34px;}
+table.sat input[type=text]{width:100%;padding:5px 8px;border:1px solid var(--line2);
+     border-radius:7px;font-family:Consolas,monospace;font-size:12px;outline:none;
+     background:var(--panel);color:var(--txt);}
+table.sat input[type=text]:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(245,158,11,.15);}
+table.sat input[type=checkbox]{accent-color:var(--acc);width:15px;height:15px;cursor:pointer;}
+table.sat td.vw{width:132px;} table.sat td.ck{width:26px;}
+table.sat td.st{width:112px;font-size:10.5px;color:var(--mut);font-family:Consolas,monospace;}
+table.sat td.st.ok{color:var(--ok);} table.sat td.st.err{color:var(--bad);}
+#safoot{border-top:1px solid var(--line);padding:11px 16px;display:flex;gap:9px;
+     align-items:center;background:var(--panel2);}
+#safoot label{font-size:11.5px;color:var(--mut);display:flex;align-items:center;gap:6px;
+     cursor:pointer;user-select:none;}
+#safoot input[type=checkbox]{accent-color:var(--acc);width:15px;height:15px;cursor:pointer;}
+#sago{margin-left:auto;background:var(--grad);color:#fff;border:none;border-radius:10px;
+     padding:10px 22px;cursor:pointer;font-weight:800;font-size:13px;letter-spacing:.3px;
+     box-shadow:0 3px 10px rgba(245,158,11,.3);transition:filter .15s,transform .1s;}
+#sago:hover{filter:brightness(1.05);transform:translateY(-1px);}
+#sago:disabled{opacity:.55;cursor:default;transform:none;box-shadow:none;}
+#sastat{font-size:11.5px;color:var(--mut);}
+#sastat.ok{color:var(--ok);} #sastat.err{color:var(--bad);}
 </style>
 </head>
 <body>
@@ -214,6 +266,9 @@ td.dim{color:var(--dim);}
   </div>
   <div class="btngrp">
     <button id="gbtn" onclick="toggleGraph()"><span class="ic">&#128200;</span>Graph</button>
+  </div>
+  <div class="btngrp">
+    <button onclick="saOpen()"><span class="ic">&#9881;</span>Set All Servos</button>
   </div>
   <div class="btngrp">
     <button onclick="saveFlash(cur)"><span class="ic">&#128190;</span>Save</button>
@@ -304,12 +359,48 @@ td.dim{color:var(--dim);}
         <input id="edin" type="text" autocomplete="off">
       </div>
       <button id="setbtn" style="display:none;" onclick="applyParam()">&#10003; Set</button>
+      <button id="setallbtn" style="display:none;" onclick="applyParamAll()">&#10003;&#10003; Set on all 12 servos</button>
       <div id="edmsg"></div>
       <div class="hint">Set writes to RAM only &mdash; use "Save to Flash" to keep values after power-off.</div>
     </div>
   </div>
 </div>
 <div id="toast"></div>
+
+<!-- ============ Set All Servos dialog ============ -->
+<div id="saback" onclick="if(event.target===this)saClose();">
+  <div id="samodal">
+    <div id="satop">
+      <span style="font-size:19px;">&#9881;</span>
+      <div><b>Set All Servos</b><br><small>write the ticked parameters to all 12 servos at once</small></div>
+      <button id="saclose" onclick="saClose()">&times;</button>
+    </div>
+    <div id="sabody">
+      <div id="satools">
+        <button onclick="saAll(1)">Tick all</button>
+        <button onclick="saAll(0)">Untick all</button>
+        <button onclick="saGains()">Gains only (Kp/Kd/Duty)</button>
+        <button onclick="saFromCur()">&#8635; Load from selected servo</button>
+        <span class="sp" id="sasrc">values below are sent to servos 1&ndash;12</span>
+      </div>
+      <table class="sat">
+        <thead><tr><th style="width:26px;"></th><th style="width:34px;">Addr</th>
+          <th>Parameter</th><th style="width:132px;">Value</th><th style="width:112px;">Result</th></tr></thead>
+        <tbody id="satb"></tbody>
+      </table>
+      <div class="hint" style="padding:10px 2px 0;">
+        Calibration values (min/max ADC, reverse flags) are per-servo &mdash; they are
+        <b>unticked by default</b>. Ticking and applying them will overwrite each servo's
+        individual calibration.
+      </div>
+    </div>
+    <div id="safoot">
+      <label><input type="checkbox" id="saflash" checked> Save to flash when done</label>
+      <span id="sastat"></span>
+      <button id="sago" onclick="saApply()">&#10003; Apply to all 12</button>
+    </div>
+  </div>
+</div>
 
 <script>
 "use strict";
@@ -436,7 +527,8 @@ function clearEditor(){
   $("edttl").textContent="select a parameter";
   $("edmeta").innerHTML=""; $("edlist").style.display="none";
   $("edinrow").style.display="none"; $("edrange").style.display="none";
-  $("setbtn").style.display="none"; setMsg("","");
+  $("setbtn").style.display="none";
+  $("setallbtn").style.display="none"; setMsg("","");
 }
 function setMsg(m,cls){ var e=$("edmsg"); e.textContent=m; e.className=cls; }
 
@@ -467,6 +559,7 @@ function selParam(p){
     $("edin").oninput=function(){ r.value=$("edin").value; };
   }
   $("setbtn").style.display="block";
+  $("setallbtn").style.display="block";
 }
 function pickOp(v,el){
   document.querySelectorAll("#edlist .op").forEach(function(e){e.classList.remove("sel");});
@@ -486,6 +579,26 @@ function applyParam(){
     $("a"+selP).textContent=fmtActual(P,d.v);
     var ec=$("edcur"); if(ec) ec.textContent=d.v;
     setMsg("OK — readback "+d.v+" (RAM only, Save to keep)","ok");
+  }).catch(function(){ setMsg("request failed","err"); });
+}
+
+/* broadcast the parameter currently open in the editor to all 12 servos */
+function applyParamAll(){
+  if(selP<0) return;
+  if(!cli){ toast("Connect first"); return; }
+  var v=parseFloat($("edin").value);
+  if(isNaN(v)){ setMsg("not a number","err"); return; }
+  var P=PARAMS[selP];
+  if(P.type!=="bool" && (v<P.min||v>P.max)){
+    setMsg("out of range ("+P.min+" .. "+P.max+")","err"); return;
+  }
+  if(!confirm("Write "+P.name+" = "+v+" to ALL 12 servos?\nRAM only — use Save All to keep."))return;
+  setMsg("writing to all 12...","");
+  jget("/api/setall?p="+selP+"&v="+v).then(function(d){
+    if(!d.ok){ setMsg("set-all failed: "+(d.err||"no reply"),"err"); return; }
+    if(d.n<12) setMsg("written to "+d.n+"/12 — no reply from servo "+d.fail.join(", "),"err");
+    else       setMsg("OK — "+P.name+" = "+d.v+" on all 12 (RAM only, Save All to keep)","ok");
+    if(cur) selServo(cur);
   }).catch(function(){ setMsg("request failed","err"); });
 }
 
@@ -575,6 +688,115 @@ function saveFlash(id){
     toast(d.ok?("saved to flash ("+(id?("board of servo "+id):"all boards")+")"):"save FAILED");
   });
 }
+/* ============== SET ALL SERVOS (one button, all 12) ============== */
+/* ticked by default = the tuning knobs you normally want identical everywhere */
+var SA_DEFAULT_ON = [5,6,7,8,9];
+/* fallback values used when nothing has been read from a servo yet */
+var SA_FALLBACK = {0:0, 1:0, 2:4096, 3:270, 4:0,
+                   5:300, 6:1000, 7:0.005, 8:0.0002, 9:0.95};
+var saBusy=false;
+
+function saBuild(){
+  var h="";
+  PARAMS.forEach(function(P){
+    var on = SA_DEFAULT_ON.indexOf(P.p)>=0;
+    var v  = (vals[P.p]!==undefined && vals[P.p]!==null) ? vals[P.p] : SA_FALLBACK[P.p];
+    h+='<tr id="sar'+P.p+'" class="'+(on?"":"off")+'">'+
+       '<td class="ck"><input type="checkbox" id="sac'+P.p+'"'+(on?" checked":"")+
+         ' onchange="saRow('+P.p+')"></td>'+
+       '<td class="ad">'+P.p+'</td>'+
+       '<td class="nm">'+P.name+'</td>'+
+       '<td class="vw"><input type="text" id="sav'+P.p+'" value="'+v+'"></td>'+
+       '<td class="st" id="sas'+P.p+'">&mdash;</td></tr>';
+  });
+  $("satb").innerHTML=h;
+}
+function saRow(p){ $("sar"+p).classList.toggle("off", !$("sac"+p).checked); }
+function saAll(on){
+  PARAMS.forEach(function(P){ $("sac"+P.p).checked=!!on; saRow(P.p); });
+}
+function saGains(){
+  PARAMS.forEach(function(P){
+    $("sac"+P.p).checked = (SA_DEFAULT_ON.indexOf(P.p)>=0); saRow(P.p);
+  });
+}
+function saFromCur(){
+  if(!cli||!cur){ toast("connect + select a servo first"); return; }
+  jget("/api/dump?id="+cur).then(function(d){
+    if(!d.ok){ toast("read failed"); return; }
+    d.params.forEach(function(o){
+      if(o.v!==null && $("sav"+o.p)) $("sav"+o.p).value=o.v;
+    });
+    $("sasrc").textContent="loaded from servo "+cur;
+    toast("values loaded from servo "+cur);
+  }).catch(function(){ toast("read failed"); });
+}
+function saOpen(){
+  if(!cli){ toast("Connect first (tuning mode)"); return; }
+  saBuild();
+  $("sastat").textContent=""; $("sastat").className="";
+  $("sasrc").textContent = cur ? ("prefilled from servo "+cur) : "values are sent to servos 1-12";
+  $("saback").classList.add("show");
+}
+function saClose(){ if(!saBusy) $("saback").classList.remove("show"); }
+
+function saApply(){
+  if(saBusy) return;
+  if(!cli){ toast("Connect first"); return; }
+  /* collect + validate the ticked rows */
+  var jobs=[], bad=null;
+  PARAMS.forEach(function(P){
+    if(!$("sac"+P.p).checked) return;
+    var v=parseFloat($("sav"+P.p).value);
+    if(isNaN(v)){ bad=bad||(P.name+": not a number"); return; }
+    if(P.type!=="bool" && (v<P.min||v>P.max)){
+      bad=bad||(P.name+": out of range ("+P.min+" .. "+P.max+")"); return;
+    }
+    if(P.type==="bool" && v!==0 && v!==1){ bad=bad||(P.name+": must be 0 or 1"); return; }
+    jobs.push({p:P.p, v:v, name:P.name});
+  });
+  if(bad){ $("sastat").textContent=bad; $("sastat").className="err"; return; }
+  if(!jobs.length){ $("sastat").textContent="nothing ticked"; $("sastat").className="err"; return; }
+
+  var doSave = $("saflash").checked;
+  saBusy=true; $("sago").disabled=true;
+  PARAMS.forEach(function(P){ var e=$("sas"+P.p); if(e){e.textContent="—";e.className="st";} });
+
+  var i=0, failed=0;
+  function step(){
+    if(i>=jobs.length){
+      saBusy=false; $("sago").disabled=false;
+      var m = failed ? (failed+" of "+jobs.length+" parameters had errors")
+                     : (jobs.length+" parameters written to all 12 servos"
+                        + (doSave?" + saved to flash":" (RAM only)"));
+      $("sastat").textContent=m; $("sastat").className=failed?"err":"ok";
+      toast(m);
+      if(cur) selServo(cur);            /* refresh the table for the open servo */
+      return;
+    }
+    var j=jobs[i];
+    var st=$("sas"+j.p); st.textContent="writing..."; st.className="st";
+    /* save flag rides along with the LAST write so flash is committed once */
+    var last=(i===jobs.length-1);
+    jget("/api/setall?p="+j.p+"&v="+j.v+(last&&doSave?"&save=1":""))
+      .then(function(d){
+        if(!d.ok){ st.textContent="FAILED"; st.className="st err"; failed++; }
+        else if(d.n<12){
+          st.textContent=d.n+"/12 (no "+d.fail.join(",")+")"; st.className="st err"; failed++;
+        }else{
+          st.textContent="12/12 OK"+(last&&doSave?(d.saved?" ✓flash":" flash FAIL"):"");
+          st.className="st ok";
+          if(last&&doSave&&!d.saved) failed++;
+        }
+        i++; step();
+      })
+      .catch(function(){
+        st.textContent="request failed"; st.className="st err"; failed++; i++; step();
+      });
+  }
+  step();
+}
+
 function factoryReset(){
   if(!cli||!cur){ toast("connect + select a servo"); return; }
   if(!confirm("Factory reset the board of servo "+cur+" (3 servos)?\nRAM only - Save to keep."))return;

@@ -422,8 +422,9 @@ def angles_to_scs(
     bf_stand: Optional[np.ndarray] = None,
     bf_sign: Optional[np.ndarray] = None,
     offset: Optional[np.ndarray] = None,
+    clip: bool = True,
 ) -> np.ndarray:
-    """Convert URDF degrees to SCS (0–1023) servo units.
+    """Convert URDF degrees to SCS servo units.
 
     Formula: SCS = round(511 + (SIGN * (deg - STAND) + offset) / 0.263)
 
@@ -433,10 +434,30 @@ def angles_to_scs(
     bf_stand : ndarray of shape (12,), default BF_STAND
     bf_sign  : ndarray of shape (12,), default BF_SIGN
     offset   : ndarray of shape (12,), default zeros
+    clip     : if True (default) clamp to [0,1023] and return uint16.
+
+    CLIPPING IS WRONG FOR THE DELTA PIPELINE — pass clip=False there.
+    ------------------------------------------------------------------
+    This function measures SCS against the NOMINAL CENTRE (511), because
+    opt_to_bf_stand_deg() maps frame 0 exactly onto BF_STAND, which maps
+    exactly onto 511. So the value returned here is really "511 + relative
+    motion", NOT the command the servo will receive.
+
+    The command the firmware actually issues is  REF[id] + (scs - 511),
+    where REF is the robot's real hand-taught stance. Clamping to [0,1023]
+    at the 511 baseline therefore clamps against the WRONG limits, and it
+    does so ASYMMETRICALLY: BF_SIGN mirrors the left legs, so one identical
+    physical motion runs off the TOP on the right leg and off the BOTTOM on
+    the left leg. After clipping the two sides no longer match, and the
+    robot splays instead of moving symmetrically.
+
+    Callers that build deltas must pass clip=False and let the delta
+    generator do a single clamp against the real REF.
 
     Returns
     -------
-    scs : ndarray of shape (n_frames, 12), dtype uint16, clipped to [0, 1023]
+    scs : (n_frames, 12) — uint16 clipped to [0,1023] if clip, else int
+          (may fall outside 0..1023, by design).
     """
     if bf_stand is None:
         bf_stand = BF_STAND
@@ -447,6 +468,8 @@ def angles_to_scs(
 
     scs_float = 511.0 + (bf_sign * (angles_deg - bf_stand) + offset) / 0.263
     scs = np.round(scs_float).astype(int)
+    if not clip:
+        return scs
     return np.clip(scs, 0, 1023).astype(np.uint16)
 
 

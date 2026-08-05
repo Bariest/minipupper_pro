@@ -20,9 +20,8 @@
 // Absolute SCS values for the starting stance.
 static const uint16_t HDF5_TRAJ1_REF[13] = {
     /* idx  1    2    3    4    5    6    7    8    9   10   11   12 */
-               0,  1023,   511,   684,  1023,   513,   671,  1023,   504,   731,   471,   512,   585
+               0, 55,  473,  597,  119,  547,  430,   27,  440,  535,  531,  542,  416
 };
-
 // ---- DELTA FRAMES (frames 1..72, relative to REF) ----
 // Each row is a signed offset from REF. int16_t for negative values.
 // After recalibration these do NOT change.

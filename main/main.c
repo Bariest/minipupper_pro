@@ -31,6 +31,11 @@
 #include "mp2_backflip2_data.h"  // hand-crafted backflip keyframes (backflip_edit.py)
 #include "mp2_caltest_data.h"    // calibration test: lift one leg at a time
 #include "hardcode_backflip_angle.h" // "Backflip 3": hand-taught SCS keyframes
+#include "mp2_bf_v4.h"           // "Backflip v4": optimizer trajectory (mp2_backflip_v4.hdf5)
+/* The "current flip" slot. Regenerated in place by tools/newflip.py, so a new
+ * HDF5 trajectory never requires a code change here — same filename, same
+ * CURRENT_FLIP_* names, every time. */
+#include "current_flip.h"
 #include "hdf5_traj1.h"          // HDF5 trajectory #1: delta-format, auto-generated
 
 #define TAG "PUPPER"
@@ -142,6 +147,20 @@ static int play_delay_ms = 0;    /* dwell/hold at each pose after the move (ms) 
 static int frame_move_ms[MAX_FRAMES];    /* per-frame move time (ms)            */
 static int frame_delay_ms[MAX_FRAMES];   /* per-frame dwell time (ms)           */
 static int use_frame_timing = 0; /* 1 = use the per-frame arrays above          */
+/* SLOW-MOTION SAFETY OVERRIDE.
+ * The HDF5 trajectories carry per-frame move times of ~24 ms. Played at that
+ * speed the servos slam pose-to-pose and can strip the gears, and it is far
+ * too fast to see whether the motion is even correct. When SlowMo is set the
+ * Play loop IGNORES frame_move_ms[]/frame_delay_ms[] and uses the global
+ * play_ms/play_delay_ms instead, so the same frames run at whatever speed the
+ * web UI is set to. Defaults ON — turn it off deliberately once the motion has
+ * been verified frame by frame. */
+static int SlowMo = 1;
+/* How many values load_current_flip() had to clamp at a servo limit. Declared
+ * up here because send_root() renders it long before load_current_flip() is
+ * defined further down. Non-zero means the trajectory does not fit and should
+ * be regenerated with a lower --scale. */
+static int current_flip_clamped = 0;
 static uint16_t cur_override_mA = 0;  /* 0 = normal cap; else force this cap    */
 
 // Backflip-specific recording (exports REF + DELTA for hardcode_backflip_angle.h)
@@ -550,6 +569,27 @@ static void serial_handle_line(char *line){
         return;
     }
     if(!strcmp(line,"recclear")){ rec_count=0; verify_idx=0; use_frame_timing=0; printf("trace cleared\n"); return; }
+    if(!strcmp(line,"slowmo on")  || !strcmp(line,"slowmo")){
+        SlowMo=1; printf("slow motion ON: Play ignores per-frame timing, uses "
+                         "pspeed=%d ms / pdelay=%d ms\n", play_ms, play_delay_ms); return; }
+    if(!strcmp(line,"slowmo off")){
+        SlowMo=0; printf("slow motion OFF: Play uses each trace's own per-frame "
+                         "timing (HDF5 traces are ~24 ms/frame)\n"); return; }
+    // Report which frames contain servo values pinned at a limit by the
+    // converter's clamp. Those joints stop following the trajectory.
+    if(!strcmp(line,"framecheck")){
+        if(rec_count==0){ printf("no frames loaded\n"); return; }
+        int total=0;
+        for(int f=0; f<rec_count; f++){
+            int n=0;
+            for(int id=1; id<=12; id++)
+                if(rec_frames[f][id]<=0 || rec_frames[f][id]>=1023) n++;
+            if(n){ printf("  frame %2d: %d joint(s) pinned at a limit\n", f, n); total+=n; }
+        }
+        printf("framecheck: %d pinned value(s) across %d frames%s\n", total, rec_count,
+               total? "  -- DO NOT run at full speed" : "  -- clean");
+        return;
+    }
     if(!strcmp(line,"recdel")){ if(rec_count>0) rec_count--; printf("%d frames left\n", rec_count); return; }
     if(!strcmp(line,"recdump")){
         /* Dump the taught keyframes as CSV (SCS 0..1023) so a PC can replay them
@@ -1402,12 +1442,21 @@ static void run_sjump(const int *ids, int nids, int hz, int reps){
     printf("#WALK_END\n");
 }
 
-#define ROOT_BUF_SZ 24000   /* room for the CLI dump output in the page */
+#define ROOT_BUF_SZ 32000   /* room for the CLI dump output + frame table */
 static esp_err_t send_root(httpd_req_t *req){
     char *b = malloc(ROOT_BUF_SZ);
     if(!b) return ESP_ERR_NO_MEM;
     int n=0;
-    #define A(...) n += snprintf(b+n, ROOT_BUF_SZ-n, __VA_ARGS__)
+    /* snprintf returns the length it WOULD have written, so once the page
+     * fills, n runs past ROOT_BUF_SZ and (ROOT_BUF_SZ - n) goes negative.
+     * That is passed as size_t -> ~4 GB -> unbounded write off the end of b.
+     * Clamp n so the macro degrades to a no-op instead of corrupting the heap. */
+    #define A(...) do{ \
+        if(n < ROOT_BUF_SZ-1){ \
+            int _w = snprintf(b+n, ROOT_BUF_SZ-n, __VA_ARGS__); \
+            n = (_w < 0) ? n : (n + _w > ROOT_BUF_SZ-1 ? ROOT_BUF_SZ-1 : n + _w); \
+        } \
+    }while(0)
     #define ON(x) ((x)?"on":"off")
 
     A("<!DOCTYPE html><html lang=\"ja\"><head><meta charset=\"utf-8\">"
@@ -1549,7 +1598,25 @@ static esp_err_t send_root(httpd_req_t *req){
       "<a href=\"/recclear\" style=\"color:white;\">Clear</a></button></div>");
     A("<p style=\"font-size:1rem;\">Frames recorded: <strong>%d</strong> / %d</p>",
       rec_count, MAX_FRAMES);
+    // ---- CURRENT FLIP: whatever tools/newflip.py last generated ----------
+    // This is the one to use. The others below are older fixed traces.
+    A("<hr><h3>&#127917; Current flip</h3>"
+      "<p style=\"font-size:0.85rem;color:#666;\">Source: <b>%s</b> &mdash; %d frames%s</p>",
+      CURRENT_FLIP_SOURCE, CURRENT_FLIP_FRAMES,
+      CURRENT_FLIP_REL_TO_INI ? ", starts from the robot's own stance" : "");
+    A("<div style=\"margin:6px auto;\">"
+      "<button type=\"button\" style=\"background:#2c3e50;color:white;width:150px;\">"
+      "<a href=\"/flipload\" style=\"color:white;\">&#128194; Load current</a></button>"
+      "<button class=\"twerk-btn %s\" type=\"button\" style=\"background:#27ae60;width:150px;\">"
+      "<a href=\"/flipplay\" style=\"color:white;\">&#9654; Play current</a></button></div>", ON(Play));
+    if(current_flip_clamped)
+        A("<p style=\"color:#c0392b;font-size:0.85rem;\"><b>%d value(s) clamped at a "
+          "servo limit.</b> Regenerate with a lower --scale before running this.</p>",
+          current_flip_clamped);
+
+    // ---- older fixed traces ----------------------------------------------
     // Load the optimized backflip poses into the trace so Verify </> steps them.
+    A("<hr><h3>&#128230; Older traces</h3>");
     A("<div style=\"margin:6px auto;\">"
       "<button type=\"button\" style=\"background:#16a085;color:white;width:210px;\">"
       "<a href=\"/bfload\" style=\"color:white;\">&#128260; Load backflip frames</a></button></div>");
@@ -1574,16 +1641,67 @@ static esp_err_t send_root(httpd_req_t *req){
       "<a href=\"/hdf5traj1load\" style=\"color:white;\">&#128194; Load HDF5 Traj 1</a></button>"
       "<button class=\"twerk-btn %s\" type=\"button\" style=\"background:#3498db;width:150px;\">"
       "<a href=\"/hdf5traj1play\" style=\"color:white;\">&#9654; Play HDF5 Traj 1</a></button></div>", ON(Play));
+    // Backflip v4: optimizer trajectory, amplitude-scaled to 0.90 so every
+    // joint stays inside the servo range (no clamped values).
+    A("<div style=\"margin:6px auto;\">"
+      "<button type=\"button\" style=\"background:#d35400;color:white;width:150px;\">"
+      "<a href=\"/bfv4load\" style=\"color:white;\">&#128194; Load Backflip v4</a></button>"
+      "<button class=\"twerk-btn %s\" type=\"button\" style=\"background:#e67e22;width:150px;\">"
+      "<a href=\"/bfv4play\" style=\"color:white;\">&#9654; Play Backflip v4</a></button></div>", ON(Play));
     // Calibration test: lift one leg at a time (FL, FR, BL, BR).
     A("<div style=\"margin:6px auto;\">"
       "<button type=\"button\" style=\"background:#e67e22;color:white;width:210px;\">"
       "<a href=\"/caltest\" style=\"color:white;\">&#129354; Load cal-test (1 leg each)</a></button></div>");
-    if(rec_count>0)
+    // ---- SLOW MOTION + frame inspector --------------------------------
+    // Play normally honours each trace's own per-frame timing. For the HDF5
+    // trajectories that is ~24 ms/frame, which slams the servos. SlowMo
+    // overrides it with the (much slower) global play_ms below.
+    A("<hr><h3>&#128034; Slow motion / frame check</h3>");
+    A("<div style=\"margin:6px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
+      "style=\"background:%s;width:320px;\"><a href=\"/slowmo\" style=\"color:white;\">"
+      "&#128034; Slow motion: %s</a></button></div>",
+      ON(SlowMo), SlowMo?"#27ae60":"#c0392b", SlowMo?"ON (safe)":"OFF - FULL SPEED");
+    A("<p style=\"font-size:0.85rem;color:#666;\">%s</p>",
+      SlowMo ? "Play uses the slow speed below and ignores the trajectory's own "
+               "per-frame timing. Safe for checking a new trace."
+             : "<b style=\"color:#c0392b;\">Play uses the trajectory's real timing "
+               "(~24 ms/frame on HDF5 traces). Only do this once the motion is "
+               "verified.</b>");
+    if(rec_count>0){
         A("Verify frame<br><a class=\"pm\" href=\"/verifyPrev\">&#9664;</a>"
           "<span>%d / %d</span><a class=\"pm\" href=\"/verifyNext\">&#9654;</a><br>",
           verify_idx+1, rec_count);
-    else
+        // Show the 12 commanded SCS values for the frame under the cursor.
+        // A value pinned at 0 or 1023 means the converter clamped it: that
+        // joint has stopped following the trajectory and is parked against
+        // its limit. Those are the frames that fight the gears.
+        static const char *jn[13] = {"",
+            "FR abd","FR hip","FR calf", "FL abd","FL hip","FL calf",
+            "RR abd","RR hip","RR calf", "RL abd","RL hip","RL calf"};
+        int n_pinned = 0;
+        A("<table style=\"margin:8px auto;font-size:0.8rem;border-collapse:collapse;\">"
+          "<tr><th style=\"padding:2px 8px;\">joint</th>"
+          "<th style=\"padding:2px 8px;\">SCS</th>"
+          "<th style=\"padding:2px 8px;\">deg</th></tr>");
+        for(int id=1; id<=12; id++){
+            int v = (int)rec_frames[verify_idx][id];
+            int pinned = (v<=0 || v>=1023);
+            if(pinned) n_pinned++;
+            A("<tr><td style=\"padding:1px 8px;\">%s</td>"
+              "<td style=\"padding:1px 8px;text-align:right;%s\">%d</td>"
+              "<td style=\"padding:1px 8px;text-align:right;color:#888;\">%+.1f</td></tr>",
+              jn[id], pinned?"color:#fff;background:#c0392b;font-weight:bold;":"",
+              v, (v-511)*0.263);
+        }
+        A("</table>");
+        if(n_pinned)
+            A("<p style=\"color:#c0392b;font-size:0.85rem;\"><b>%d joint(s) pinned "
+              "at a servo limit in this frame.</b> The converter clamped them, so "
+              "they are no longer following the trajectory. Do not run this at "
+              "full speed.</p>", n_pinned);
+    } else {
         A("<p style=\"color:#999;\">Verify frame: none recorded yet</p>");
+    }
     A("<div style=\"margin:6px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
       "style=\"background:#27ae60;\"><a href=\"/play\" style=\"color:white;\">"
       "&#9654; Play once</a></button></div>", ON(Play));
@@ -1842,6 +1960,8 @@ static esp_err_t h_verify(httpd_req_t*r){
 }
 static esp_err_t h_verifyPrev(httpd_req_t*r){ start_goto(verify_idx-1); return send_root(r); }
 static esp_err_t h_verifyNext(httpd_req_t*r){ start_goto(verify_idx+1); return send_root(r); }
+// Toggle the slow-motion override (Play ignores per-frame timing while ON).
+static esp_err_t h_slowmo(httpd_req_t*r){ SlowMo = !SlowMo; return send_root(r); }
 // Load the 28 optimized backflip poses into the trace buffer (as SCS) so the
 // Verify </> buttons step through the FLIP frames one by one.
 static esp_err_t h_bfload(httpd_req_t*r){
@@ -1927,6 +2047,64 @@ static void load_hdf5_traj1(void){
     }
     rec_count = nf; verify_idx = 0; use_frame_timing = 1;
 }
+// ---- Backflip v4 (optimizer trajectory, mp2_backflip_v4.hdf5) ----
+// Generated with --scale 0.90, which is the largest amplitude at which every
+// joint stays inside 0..1023. At full scale the two front knees ran past their
+// limits on 9 frames and would have been clamped (i.e. parked against the stop
+// while the trajectory kept moving).
+static void load_mp2_bf_v4(void){
+    int nf = MP2_BF_V4_FRAMES < MAX_FRAMES ? MP2_BF_V4_FRAMES : MAX_FRAMES;
+    for(int f=0; f<nf; f++){
+        for(int id=1; id<=12; id++)
+            rec_frames[f][id] = (uint16_t)((int)MP2_BF_V4_REF[id] + (f==0 ? 0 : (int)MP2_BF_V4_DELTA[f-1][id]));
+        frame_move_ms[f]  = MP2_BF_V4_MOVE_MS[f];
+        frame_delay_ms[f] = MP2_BF_V4_DELAY_MS[f];
+    }
+    rec_count = nf; verify_idx = 0; use_frame_timing = 1;
+}
+static esp_err_t h_bfv4load(httpd_req_t*r){ reset_all_modes(); load_mp2_bf_v4(); return send_root(r); }
+static esp_err_t h_bfv4play(httpd_req_t*r){ reset_all_modes(); load_mp2_bf_v4(); started_once=1; Play=1; return send_root(r); }
+
+// ---- CURRENT FLIP: the slot tools/newflip.py writes ----------------------
+// Regenerating current_flip.h swaps the motion. Nothing below changes.
+//
+// When CURRENT_FLIP_REL_TO_INI is set the deltas are added onto the LIVE Ini
+// stance (511 + offset[]/0.263, i.e. your `setcal` calibration) rather than a
+// baked-in REF. So the motion starts from wherever the robot is already
+// standing — no teaching, and nothing to redo after a recalibration.
+static void load_current_flip(void){
+    uint16_t ini[13]; fill_ini_frame(ini);
+    int nf = CURRENT_FLIP_FRAMES < MAX_FRAMES ? CURRENT_FLIP_FRAMES : MAX_FRAMES;
+    current_flip_clamped = 0;
+    for(int f=0; f<nf; f++){
+        for(int id=1; id<=12; id++){
+            // Deliberately a runtime ternary on a compile-time constant rather
+            // than an #if: both arms stay compiled, so neither ini[] nor
+            // CURRENT_FLIP_REF[] can go unreferenced and trip
+            // -Wunused-const-variable under -Werror=all. The compiler folds it.
+            int base = CURRENT_FLIP_REL_TO_INI ? (int)ini[id]
+                                               : (int)CURRENT_FLIP_REF[id];
+            int v = base + (f==0 ? 0 : (int)CURRENT_FLIP_DELTA[f-1][id]);
+            // Clamp HERE, not with a silent cast. A value past the stop means
+            // that joint has left the trajectory; count it so the web page and
+            // `framecheck` can say so out loud.
+            if(v < 0)    { v = 0;    current_flip_clamped++; }
+            if(v > 1023) { v = 1023; current_flip_clamped++; }
+            rec_frames[f][id] = (uint16_t)v;
+        }
+        frame_move_ms[f]  = CURRENT_FLIP_MOVE_MS[f];
+        frame_delay_ms[f] = CURRENT_FLIP_DELAY_MS[f];
+    }
+    rec_count = nf; verify_idx = 0; use_frame_timing = 1;
+    printf("current flip: %s, %d frames%s\n", CURRENT_FLIP_SOURCE, nf,
+           CURRENT_FLIP_REL_TO_INI ? " (from robot's own stance)" : "");
+    if(current_flip_clamped)
+        printf("  WARNING: %d value(s) clamped at a servo limit -- "
+               "regenerate with a lower --scale\n", current_flip_clamped);
+}
+static esp_err_t h_fliploadr(httpd_req_t*r){ reset_all_modes(); load_current_flip(); return send_root(r); }
+static esp_err_t h_flipplay(httpd_req_t*r){ reset_all_modes(); load_current_flip(); started_once=1; Play=1; return send_root(r); }
+
 static esp_err_t h_hdf5traj1load(httpd_req_t*r){ reset_all_modes(); load_hdf5_traj1(); return send_root(r); }
 static esp_err_t h_hdf5traj1play(httpd_req_t*r){ reset_all_modes(); load_hdf5_traj1(); started_once=1; Play=1; return send_root(r); }
 static esp_err_t h_pspM(httpd_req_t*r){ if(play_ms>100){ play_ms-=100; nvs_put_int("play_ms",play_ms);} return send_root(r); }
@@ -2214,6 +2392,34 @@ static esp_err_t h_api_set(httpd_req_t*r){
     return api_json(r,"{\"ok\":false,\"err\":\"no reply\"}");
 }
 
+/* /api/setall?p=P&v=V[&save=1] : write ONE parameter to ALL 12 servos (RAM),
+ * optionally commit every board to flash afterwards.
+ * Reply: {"ok":true,"p":P,"v":V,"n":<written>,"fail":[ids...],"saved":bool} */
+static esp_err_t h_api_setall(httpd_req_t*r){
+    int p    = api_qint(r,"p",-1);
+    int save = api_qint(r,"save",0);
+    float v  = api_qfloat(r,"v",0), rb=0;
+    if(!CliMode)               return api_json(r,"{\"ok\":false,\"err\":\"climode\"}");
+    if(p<0||p>=DB_PARAM_COUNT) return api_json(r,"{\"ok\":false,\"err\":\"bad param\"}");
+
+    char fail[64]; int fn=0, n=0;
+    fail[0]=0;
+    for(int id=1; id<=12; id++){
+        bool ok = driver_board_set_param(id,p,v) && driver_board_get_param(id,p,&rb);
+        if(ok) n++;
+        else   fn += snprintf(fail+fn,sizeof fail-fn,"%s%d", fn?",":"", id);
+        vTaskDelay(pdMS_TO_TICKS(2));   /* give the AT32 time between writes */
+    }
+    bool saved = false;
+    if(save && n) saved = driver_board_save_config(-1);   /* -1 = all boards */
+
+    char b[192];
+    snprintf(b,sizeof b,
+        "{\"ok\":%s,\"p\":%d,\"v\":%g,\"n\":%d,\"fail\":[%s],\"saved\":%s}",
+        n?"true":"false", p, v, n, fail, saved?"true":"false");
+    return api_json(r,b);
+}
+
 /* /api/live?id=N : live control-loop values (same set as 'trace') */
 static esp_err_t h_api_live(httpd_req_t*r){
     int id = api_qint(r,"id",0);
@@ -2320,11 +2526,14 @@ static void start_webserver(void){
     reg(s,"/mirror",h_mirror);     reg(s,"/play",h_play);
     reg(s,"/verify",h_verify);     reg(s,"/verifyPrev",h_verifyPrev);
     reg(s,"/verifyNext",h_verifyNext);
+    reg(s,"/slowmo",h_slowmo);
     reg(s,"/bfload",h_bfload);
     reg(s,"/bfload2",h_bfload2);
     reg(s,"/bfload3",h_bfload3);   reg(s,"/bf3",h_bf3);
     reg(s,"/bfload4",h_bfload4);   reg(s,"/bf4",h_bf4);
     reg(s,"/hdf5traj1load",h_hdf5traj1load); reg(s,"/hdf5traj1play",h_hdf5traj1play);
+    reg(s,"/bfv4load",h_bfv4load);           reg(s,"/bfv4play",h_bfv4play);
+    reg(s,"/flipload",h_fliploadr);          reg(s,"/flipplay",h_flipplay);
     reg(s,"/caltest",h_caltest);
     reg(s,"/pos",h_pos);           // live servo positions (CSV) for teach_live.py
     reg(s,"/pspM",h_pspM);         reg(s,"/pspP",h_pspP);
@@ -2343,6 +2552,7 @@ static void start_webserver(void){
     reg(s,"/api/climode",h_api_climode);
     reg(s,"/api/dump",h_api_dump);
     reg(s,"/api/set",h_api_set);
+    reg(s,"/api/setall",h_api_setall);
     reg(s,"/api/live",h_api_live);
     reg(s,"/api/save",h_api_save);
     reg(s,"/api/restore",h_api_restore);
@@ -2498,7 +2708,10 @@ static void gait_task(void *arg){
             // the stance pose at the end and hold there.
             cur_override_mA = 0;
             uint16_t ini[13]; fill_ini_frame(ini);
-            if(use_frame_timing){
+            // SlowMo forces the global play_ms/play_delay_ms even for traces
+            // that shipped their own per-frame timing (Backflip 3/4, HDF5).
+            const int ft = use_frame_timing && !SlowMo;
+            if(ft){
                 // Backflip 3/4 (per-frame timing): start from the reference
                 // frame (frame 0 = BF3_REF) instead of ini, so the robot
                 // establishes the reference pose FIRST, then plays the delta
@@ -2508,13 +2721,18 @@ static void gait_task(void *arg){
                 if(mv0 < 1) mv0 = 1;
                 interp_to(rec_frames[0], mv0, &Play);
                 dwell_ms(dl0, &Play);
+            } else if(use_frame_timing){
+                // SlowMo + a delta trace: still establish frame 0 (the REF
+                // stance) first, but travel there at the slow global speed.
+                interp_to(rec_frames[0], play_ms, &Play);
+                dwell_ms(play_delay_ms, &Play);
             } else {
                 interp_to(ini, play_ms, &Play);      // "all start from initial position"
             }
             for(int f=(use_frame_timing?1:0); f<rec_count && Play; f++){
                 // per-frame timing (Backflip 3/4) if loaded, else the globals
-                int mv = use_frame_timing ? frame_move_ms[f]  : play_ms;
-                int dl = use_frame_timing ? frame_delay_ms[f] : play_delay_ms;
+                int mv = ft ? frame_move_ms[f]  : play_ms;
+                int dl = ft ? frame_delay_ms[f] : play_delay_ms;
                 if(mv < 1) mv = 1;
                 interp_to(rec_frames[f], mv, &Play);
                 dwell_ms(dl, &Play);              // dwell at this pose
