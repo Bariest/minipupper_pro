@@ -35,7 +35,7 @@
 // play_ms (1000 ms) and ignores frame_move_ms[] entirely. Only Play read the
 // zero-padded tail. The arrays below are now unsized + _Static_assert'd so a
 // short table is a compile error instead of a silent slam.
-#define BF3_FRAMES 8
+#define BF3_FRAMES 6
 
 // static const uint16_t BF3_SCS[BF3_FRAMES][13] = {
 //     /* idx      1    2    3    4    5    6    7    8    9   10   11   12 */
@@ -62,7 +62,7 @@
 // this way — that has been fixed too.
 static const uint16_t BF3_REF[13] = {
     /* idx  1     2    3    4    5    6    7    8    9   10   11   12 */
-         0,  53,  470,  482,  112,  557,  497,   25,  532,  402,  515,  310,  405
+         0,  54,  473,  596,  113,  536,  420,   26,  478,  515,  531,  544,  439
 };
 _Static_assert(sizeof(BF3_REF) / sizeof(BF3_REF[0]) == 13,
                "BF3_REF needs 13 entries: unused [0] + servos 1..12");
@@ -76,21 +76,21 @@ _Static_assert(sizeof(BF3_REF) / sizeof(BF3_REF[0]) == 13,
 // Row i here is played as frame i+1 (frame 0 is BF3_REF itself).
 static const int16_t BF3_DELTA[][13] = {
     /* frame 1 — settle onto the start stance */
-    {0,  0,    18,  -130,    -1,    41,   129,     1,    -5,   -13,    39,    -5,    24},
+    {0,  -1,    54,   184,    -1,   -74,   157,    -1,   111,   -59,    29,   -99,    -9},
 
      /* frame 2 — crouch */
-    {0,     0,   -58,   -70,     0,   -36,   142,     0,   132,    50,   -41,  -115,   -89},
+    {0,     0,    73,  -138,     0,   -89,  -196,     0,   106,   -62,    83,   -96,    -6},
     
     /* frame 3 — front leg lifting */
-    {0, 0,   162,    75,     0,  -159,   -64,     0,   132,    33,   105,  -116,   -10},
+    {0, 0,    65,  -131,     1,   -78,  -187,     0,  -271,   307,    65,   254,  -367},
     /* frame 4 — back leg rotating */
-    {0, 0,   147,   103,     0,  -135,  -104,     0,  -104,   138,    89,    74,  -159},
+    {0, -1,    66,  -122,    -1,   -78,  -187,     0,  -290,   452,    66,   234,  -430},
     /* frame 5 — back leg pushing */
-    {0, 0,   152,   106,     0,   -94,   -76,     0,   -11,   277,    88,     8,  -283},
+    {0, 0,   339,   225,     0,  -308,   232,     0,  -289,   132,   311,   302,  -127},
     /* frame 6 — retract front leg */
-    {0, 0,   169,  -248,     0,  -192,   254,     0,   -23,   179,   104,    19,  -167},
+    //{0, 0,   169,  -248,     0,  -192,   254,     0,   -23,   179,   104,    19,  -167},
     /* frame 7 — back leg retracting and front leg landing */
-    {0,  0,   164,  -267,     0,  -178,   284,     0,   173,  -119,   104,  -175,   127},
+    //{0,  0,   164,  -267,     0,  -178,   284,     0,   173,  -119,   104,  -175,   127},
 };
 
 // ---- PER-FRAME TIMING (edit these freely) --------------------------------
@@ -109,8 +109,11 @@ static const int16_t BF3_DELTA[][13] = {
 // _Static_assert below catches a short table at compile time.
 //
 //                                    f=  0     1    2   3   4    5    6    7
- static const int BF3_MOVE_MS[]  = {  1000,  1000,  45, 75, 45, 100, 150, 150 };
- static const int BF3_DELAY_MS[] = {   500,  500,   45, 110, 90, 150,   0, 300 };
+// static const int BF3_MOVE_MS[]  = {  1000,  1000,  45, 75, 45, 100, 150, 150 };
+// static const int BF3_DELAY_MS[] = {   500,  500,   45, 110, 90, 150,   0, 300 };
+
+static const int BF3_MOVE_MS[]  = {  1000,  30,  70, 30, 90 };
+ static const int BF3_DELAY_MS[] = {   500,  30,  20, 100, 3000};
 //                                                                     ^^^  ^^^
 // The last MOVE_MS (150) and last two DELAY_MS (0, 300) were never written —
 // they used to fall off the end of the table and come back as 0, which
