@@ -687,10 +687,21 @@ static void serial_handle_line(char *line){
     if(!strncmp(line,"pose_bf",7) && (line[7]==' ' || line[7]==',' || line[7]=='\t' || line[7]=='\0')){
         if(line[7]=='\0'){ printf("usage: pose_bf d1,d2,...,d12  (12 signed delta values)\n"); return; }
         char tmp[160]; strncpy(tmp,line+8,sizeof tmp-1); tmp[sizeof tmp-1]=0;
+        /* Reference to apply the deltas to. If frames have been taught this
+         * session (rec_bf), bf_ref[] IS the new start stance — use it, so the
+         * deltas straight out of `recdump_bf` land on the pose you just taught
+         * instead of the stale flashed BF3_REF[]. */
+        const int use_live_ref = (bf_count > 0);
         int v[13]; int n=0; char *sp_bf=NULL;
         for(char *tk=strtok_r(tmp," ,\t",&sp_bf); tk && n<12; tk=strtok_r(NULL," ,\t",&sp_bf)){
             int delta = atoi(tk);
-            int scs = (int)BF3_REF[n] + delta;  // n is already 1-indexed (++n above)
+            /* n is still 0-based HERE (the ++n below happens after this read),
+             * so servo id = n+1. Reading BF3_REF[n] shifted every joint onto
+             * its neighbour's reference: servo 1 got BF3_REF[0] (the unused 0),
+             * servo 2 got servo 1's value, etc. */
+            int id  = n + 1;
+            int ref = use_live_ref ? (int)bf_ref[id] : (int)BF3_REF[id];
+            int scs = ref + delta;
             if(scs<0) scs=0;
             if(scs>1023) scs=1023;
             v[++n] = scs;
@@ -699,7 +710,8 @@ static void serial_handle_line(char *line){
         reset_all_modes();
         for(int i=1;i<=12;i++) pose_target[i]=(uint16_t)v[i];
         started_once=1; GotoPose=1;
-        printf("pose_bf: moving to delta->SCS %d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+        printf("pose_bf: ref=%s -> SCS %d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+               use_live_ref ? "bf_ref (just taught)" : "BF3_REF (flashed)",
                v[1],v[2],v[3],v[4],v[5],v[6],v[7],v[8],v[9],v[10],v[11],v[12]);
         return;
     }

@@ -61,8 +61,8 @@
 // had their leading 0; only REF was short. `recdump_bf` in main.c printed it
 // this way — that has been fixed too.
 static const uint16_t BF3_REF[13] = {
-    /* idx  0     1     2    3     4    5     6     7    8     9   10   11   12 */
-             0, 1023,  511,  684, 1023,  513,  671, 1023,  504,  731,  471,  512,  585
+    /* idx  1     2    3    4    5    6    7    8    9   10   11   12 */
+         0,  53,  470,  482,  112,  557,  497,   25,  532,  402,  515,  310,  405
 };
 _Static_assert(sizeof(BF3_REF) / sizeof(BF3_REF[0]) == 13,
                "BF3_REF needs 13 entries: unused [0] + servos 1..12");
@@ -76,7 +76,7 @@ _Static_assert(sizeof(BF3_REF) / sizeof(BF3_REF[0]) == 13,
 // Row i here is played as frame i+1 (frame 0 is BF3_REF itself).
 static const int16_t BF3_DELTA[][13] = {
     /* frame 1 — settle onto the start stance */
-    {0, 0,    -6,     0,     0,     0,     1,     0,   139,    51,   -35,  -116,   -90},
+    {0,  0,    18,  -130,    -1,    41,   129,     1,    -5,   -13,    39,    -5,    24},
 
      /* frame 2 — crouch */
     {0,     0,   -58,   -70,     0,   -36,   142,     0,   132,    50,   -41,  -115,   -89},
