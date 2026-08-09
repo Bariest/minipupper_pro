@@ -35,6 +35,7 @@
 // play_ms (1000 ms) and ignores frame_move_ms[] entirely. Only Play read the
 // zero-padded tail. The arrays below are now unsized + _Static_assert'd so a
 // short table is a compile error instead of a silent slam.
+// Total playback frames = 1 reference pose (BF3_REF) + 5 delta keyframes.
 #define BF3_FRAMES 6
 
 // static const uint16_t BF3_SCS[BF3_FRAMES][13] = {
@@ -62,7 +63,7 @@
 // this way — that has been fixed too.
 static const uint16_t BF3_REF[13] = {
     /* idx  1     2    3    4    5    6    7    8    9   10   11   12 */
-         0,  54,  473,  596,  113,  536,  420,   26,  478,  515,  531,  544,  439
+         0,   44,  478,  585,   89,  538,  421,   23,  431,  514,  532,  544,  417
 };
 _Static_assert(sizeof(BF3_REF) / sizeof(BF3_REF[0]) == 13,
                "BF3_REF needs 13 entries: unused [0] + servos 1..12");
@@ -76,17 +77,17 @@ _Static_assert(sizeof(BF3_REF) / sizeof(BF3_REF[0]) == 13,
 // Row i here is played as frame i+1 (frame 0 is BF3_REF itself).
 static const int16_t BF3_DELTA[][13] = {
     /* frame 1 — settle onto the start stance */
-    {0,  -1,    54,   184,    -1,   -74,   157,    -1,   111,   -59,    29,   -99,    -9},
+    {0, 0,    42,  -202,     0,   -63,   153,     1,   215,  -128,    24,  -126,    82},
 
      /* frame 2 — crouch */
-    {0,     0,    73,  -138,     0,   -89,  -196,     0,   106,   -62,    83,   -96,    -6},
+    {0,    0,   158,    68,     0,  -163,  -118,     0,   215,  -128,   170,  -125,    79},
     
     /* frame 3 — front leg lifting */
-    {0, 0,    65,  -131,     1,   -78,  -187,     0,  -271,   307,    65,   254,  -367},
+    {0,   1,   154,    68,     1,  -163,  -118,     1,  -152,    76,   168,   239,  -136},
     /* frame 4 — back leg rotating */
-    {0, -1,    66,  -122,    -1,   -78,  -187,     0,  -290,   452,    66,   234,  -430},
+    {0, 1,   154,    68,     0,  -166,  -118,     0,  -129,   332,   168,   171,  -402},
     /* frame 5 — back leg pushing */
-    {0, 0,   339,   225,     0,  -308,   232,     0,  -289,   132,   311,   302,  -127},
+    {0, 1,   177,  -311,     1,  -181,   261,     1,   -50,   124,   148,   109,  -155},
     /* frame 6 — retract front leg */
     //{0, 0,   169,  -248,     0,  -192,   254,     0,   -23,   179,   104,    19,  -167},
     /* frame 7 — back leg retracting and front leg landing */
@@ -112,14 +113,17 @@ static const int16_t BF3_DELTA[][13] = {
 // static const int BF3_MOVE_MS[]  = {  1000,  1000,  45, 75, 45, 100, 150, 150 };
 // static const int BF3_DELAY_MS[] = {   500,  500,   45, 110, 90, 150,   0, 300 };
 
-static const int BF3_MOVE_MS[]  = {  1000,  30,  70, 30, 90 };
- static const int BF3_DELAY_MS[] = {   500,  30,  20, 100, 3000};
-//                                                                     ^^^  ^^^
-// The last MOVE_MS (150) and last two DELAY_MS (0, 300) were never written —
-// they used to fall off the end of the table and come back as 0, which
-// interp_to() clamps to 1 ms. 150 matches the neighbouring airborne frames and
-// 300 gives the landing time to settle before Play returns to the Ini stance.
-// Tune all three on the robot.
+//                                 f=   0    1    2    3     4    5
+static const int BF3_MOVE_MS[]  = { 1000 ,1000,  30,  70,  50,   90 };
+static const int BF3_DELAY_MS[] = {  500, 500,  70,  85, 100, 3000};
+//                                                        ^^^^^^^^^^^^
+// f=4 holds 3000 ms before the push-off — that is a deliberate long dwell, not
+// a typo; drop it if you want the flip to run continuously.
+// f=5 (back-leg push) had no timing at all until now: the tables were one entry
+// short, so both values fell off the end and came back 0, which interp_to()
+// clamps to 1 ms — the push was slammed instantly. 90 ms matches the
+// neighbouring airborne frame; the 300 ms dwell lets the landing settle before
+// Play interpolates back to the Ini stance. Tune both on the robot.
 
 _Static_assert(sizeof(BF3_DELTA)    / sizeof(BF3_DELTA[0])    == BF3_FRAMES - 1,
                "BF3_DELTA row count must be BF3_FRAMES - 1");
