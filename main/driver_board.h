@@ -51,7 +51,7 @@ extern "C" {
  * offset[] calibration all address the same servo by the same id. Set
  * SERVO_BOARD and re-flash to switch builds.
  * ---------------------------------------------------------------------- */
-#define SERVO_BOARD 5
+#define SERVO_BOARD 1
 
 static inline int db_phys(int logical){
 #if SERVO_BOARD == 2
@@ -146,21 +146,21 @@ static inline int db_phys_inv(int physical){
     // original mapping for SERVO_BOARD 1 (default)
     switch(physical){
         // FR board (CS9): ports 1,2,3
-        case 1:  return 3;   // FR Calf  -> logical 3
+        case 1:  return 1;   // FR Calf  -> logical 3
         case 2:  return 2;   // FR Thigh -> logical 2
-        case 3:  return 1;   // broken   -> logical 1 (FR Abd, no servo)
+        case 3:  return 3;   // broken   -> logical 1 (FR Abd, no servo)
         // FL board (CS10): ports 4,5,6
-        case 4:  return 6;   // FL Calf  -> logical 6
+        case 4:  return 4;   // FL Calf  -> logical 6
         case 5:  return 5;   // FL Thigh -> logical 5
-        case 6:  return 8;   // RR Thigh -> logical 8 (cross-board!)
+        case 6:  return 6;   // RR Thigh -> logical 8 (cross-board!)
         // RR board (CS21): ports 7,8,9
-        case 7:  return 9;   // RR Calf  -> logical 9
-        case 8:  return 10;  // broken   -> logical 10 (RL Abd, no servo)
-        case 9:  return 7;   // broken   -> logical 7 (RR Abd, no servo)
+        case 7:  return 7;   // RR Calf  -> logical 9
+        case 8:  return 8;  // broken   -> logical 10 (RL Abd, no servo)
+        case 9:  return 9;   // broken   -> logical 7 (RR Abd, no servo)
         // RL board (CS14): ports 10,11,12
-        case 10: return 12;  // RL Calf  -> logical 12
+        case 10: return 10;  // RL Calf  -> logical 12
         case 11: return 11;  // RL Thigh -> logical 11
-        case 12: return 4;   // broken   -> logical 4 (FL Abd, no servo)
+        case 12: return 12;   // broken   -> logical 4 (FL Abd, no servo)
         default: return physical;
     }
 #endif
