@@ -63,7 +63,7 @@
 // this way — that has been fixed too.
 static const uint16_t BF3_REF[13] = {
     /* idx  1     2    3    4    5    6    7    8    9   10   11   12 */
-         0,   44,  478,  585,   89,  538,  421,   23,  431,  514,  532,  544,  417
+         0,   40,  504,  588,   44,  475,  528,   40,  505,  506,   42,  517,  371
 };
 _Static_assert(sizeof(BF3_REF) / sizeof(BF3_REF[0]) == 13,
                "BF3_REF needs 13 entries: unused [0] + servos 1..12");
@@ -77,17 +77,17 @@ _Static_assert(sizeof(BF3_REF) / sizeof(BF3_REF[0]) == 13,
 // Row i here is played as frame i+1 (frame 0 is BF3_REF itself).
 static const int16_t BF3_DELTA[][13] = {
     /* frame 1 — settle onto the start stance */
-    {0, 0,    42,  -202,     0,   -63,   153,     1,   215,  -128,    24,  -126,    82},
+    {0,  0,   -93,  -109,    -1,    98,   107,     0,   186,  -132,    -1,  -216,   177},
 
      /* frame 2 — crouch */
-    {0,    0,   158,    68,     0,  -163,  -118,     0,   215,  -128,   170,  -125,    79},
+    {0,    0,   189,    21,    -1,  -175,   -51,     0,   170,   -80,    -1,  -136,   119},
     
     /* frame 3 — front leg lifting */
-    {0,   1,   154,    68,     1,  -163,  -118,     1,  -152,    76,   168,   239,  -136},
+    {0,   0,   201,    18,     0,  -181,   -47,     0,  -256,    54,     0,   223,   -39},
     /* frame 4 — back leg rotating */
-    {0, 1,   154,    68,     0,  -166,  -118,     0,  -129,   332,   168,   171,  -402},
+    {0,  0,   204,     2,     0,  -181,   -47,     0,  -134,   328,    -1,   123,  -322},
     /* frame 5 — back leg pushing */
-    {0, 1,   177,  -311,     1,  -181,   261,     1,   -50,   124,   148,   109,  -155},
+    {0,  -1,   254,  -367,    -1,  -262,   357,     0,   -47,   -36,    -1,    49,    48},
     /* frame 6 — retract front leg */
     //{0, 0,   169,  -248,     0,  -192,   254,     0,   -23,   179,   104,    19,  -167},
     /* frame 7 — back leg retracting and front leg landing */
@@ -114,8 +114,8 @@ static const int16_t BF3_DELTA[][13] = {
 // static const int BF3_DELAY_MS[] = {   500,  500,   45, 110, 90, 150,   0, 300 };
 
 //                                 f=   0    1    2    3     4    5
-static const int BF3_MOVE_MS[]  = { 1000 ,1000,  30,  70,  50,   90 };
-static const int BF3_DELAY_MS[] = {  500, 500,  70,  85, 100, 3000};
+static const int BF3_MOVE_MS[]  = { 1000 ,1000,  30,  30,  30,   90 };
+static const int BF3_DELAY_MS[] = {  500, 500,  20,  35, 100, 3000};
 //                                                        ^^^^^^^^^^^^
 // f=4 holds 3000 ms before the push-off — that is a deliberate long dwell, not
 // a typo; drop it if you want the flip to run continuously.
