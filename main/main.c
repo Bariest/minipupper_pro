@@ -36,6 +36,7 @@
  * HDF5 trajectory never requires a code change here — same filename, same
  * CURRENT_FLIP_* names, every time. */
 #include "current_flip.h"
+#include "backflip20.h"          // Backflip20 button: linear-interp playback
 #include "hdf5_traj1.h"          // HDF5 trajectory #1: delta-format, auto-generated
 
 #define TAG "PUPPER"
@@ -74,6 +75,7 @@ static int Ini=0, Step=0, Roll=0, Pitch=0, Stretch=0;
 static int Advance=0, Back=0, Left=0, Right=0, TurnL=0, TurnR=0;
 static int Twerk=0, Jump=0, JumpFwd=0, TestSpeed=0, Mate=0, Stanford=0;
 static int Backflip=0;   // optimized backflip playback (bench demo, see gait loop)
+static int Backflip20=0; // backflip20.h playback, linear interp (see backflip20_run)
 static int sg_started=0;   // Stanford gait state initialised for this activation
 
 // CLI mode: pauses the gait loop so the HTTP task has exclusive SPI access
@@ -167,6 +169,12 @@ static uint16_t cur_override_mA = 0;  /* 0 = normal cap; else force this cap    
 static uint16_t bf_ref[13] = {0};          /* reference frame (absolute SCS)    */
 static uint16_t bf_frames[MAX_FRAMES][13]; /* all recorded frames (absolute SCS)*/
 static int bf_count = 0;                   /* number of recorded frames         */
+/* Per-frame move time for the taught frames, editable from the web UI. Kept
+ * separate from frame_move_ms[] because that belongs to whatever trace is
+ * currently loaded; this survives loading and re-loading the taught set. */
+static uint16_t bf_move_ms[MAX_FRAMES];
+static uint16_t bf_delay_ms[MAX_FRAMES];
+static int bf_ref_idx = 0;                 /* which taught frame is the REF     */
 
 static inline void servo_speed(int ch, uint16_t spd){
     goal_speed[ch] = spd;
@@ -199,6 +207,7 @@ static void reset_all_modes(void){
     Ini=Step=Roll=Pitch=Stretch=0;
     Advance=Back=Left=Right=TurnL=TurnR=Twerk=Jump=JumpFwd=TestSpeed=Mate=Stanford=0; // <-- add TestSpeed here
     Backflip=0;
+    Backflip20=0;
     for(int i=1;i<=12;i++) manual_ovr[i]=0;
     sg_started=0;
     Relax=Play=Goto=HoldPose=GotoPose=0;   // stop teach / playback modes too
@@ -1442,7 +1451,11 @@ static void run_sjump(const int *ids, int nids, int hz, int reps){
     printf("#WALK_END\n");
 }
 
-#define ROOT_BUF_SZ 32000   /* room for the CLI dump output + frame table */
+#define ROOT_BUF_SZ 40000   /* room for the CLI dump output + frame table */
+/* How many taught frames get their angles printed. ~250 bytes each; the whole
+ * page shares ROOT_BUF_SZ with cli_out, so this is what keeps a long teach
+ * session from truncating the page. */
+#define BF_DETAIL_ROWS 24
 static esp_err_t send_root(httpd_req_t *req){
     char *b = malloc(ROOT_BUF_SZ);
     if(!b) return ESP_ERR_NO_MEM;
@@ -1497,6 +1510,113 @@ static esp_err_t send_root(httpd_req_t *req){
     A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
       "style=\"background:#8e44ad;\"><a href=\"/backflip\" style=\"color:white;\">&#128260; Backflip</a>"
       "</button></div>", ON(Backflip));
+    /* Backflip20: its own table (backflip20.h) played with LINEAR interpolation,
+     * so it reproduces play_slow.py rather than the smoothstep Play path. Timing
+     * lives in the table, so SlowMo does not apply to it. */
+    A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
+      "style=\"background:#16a085;\"><a href=\"/backflip20\" style=\"color:white;\">"
+      "&#128260; Backflip20 (%s)</a></button>"
+      "<button class=\"twerk-btn\" type=\"button\" style=\"background:#7f8c8d;\">"
+      "<a href=\"/bf20load\" style=\"color:white;\">&#128194; Load for Verify</a>"
+      "</button></div>", ON(Backflip20), BF20_SOURCE);
+
+    /* ---- Teach a backflip by hand, from the browser --------------------- */
+    A("<hr><h3 style=\"margin:6px;\">Teach backflip</h3>");
+    A("<div style=\"margin:6px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
+      "style=\"background:%s;\"><a href=\"/bfteach\" style=\"color:white;\">"
+      "&#9995; Teach %s</a></button>"
+      "<button class=\"twerk-btn\" type=\"button\" style=\"background:#27ae60;\">"
+      "<a href=\"/bfrec\" style=\"color:white;\">&#11044; Record frame</a></button>"
+      "</div>", ON(Relax), Relax?"#c0392b":"#2980b9", Relax?"ON (limp)":"OFF");
+    A("<p style=\"font-size:0.9rem;\">Taught frames: <strong>%d</strong> / %d"
+      " &middot; reference = frame %d</p>", bf_count, MAX_FRAMES, bf_ref_idx);
+    A("<div style=\"margin:6px auto;\">"
+      "<button class=\"twerk-btn\" type=\"button\" style=\"background:#e67e22;\">"
+      "<a href=\"/bfdel\" style=\"color:white;\">&#9003; Undo last</a></button>"
+      "<button class=\"twerk-btn\" type=\"button\" style=\"background:#7f8c8d;\">"
+      "<a href=\"/bfclear\" style=\"color:white;\">&#128465; Clear all</a></button>"
+      "<button class=\"twerk-btn\" type=\"button\" style=\"background:#8e44ad;\">"
+      "<a href=\"/bftaughtload\" style=\"color:white;\">&#128194; Load for Verify</a></button>"
+      "<button class=\"twerk-btn\" type=\"button\" style=\"background:#16a085;\">"
+      "<a href=\"/bfreplay\" style=\"color:white;\">&#9654; Replay</a></button>"
+      "<button class=\"twerk-btn\" type=\"button\" style=\"background:#34495e;\">"
+      "<a href=\"/bfdump\" style=\"color:white;\">&#128203; Dump C code</a></button>"
+      "</div>");
+
+    /* Show the dump here as well as in the CLI pane. That pane lives inside
+     * `if(CliMode)`, so with CLI mode off - which is the normal state while
+     * teaching - pressing Dump wrote the text and rendered it nowhere. */
+    if(!CliMode && cli_out[0])
+        A("<pre style=\"text-align:left;background:#111;color:#0f0;padding:8px;"
+          "margin:6px;font-size:0.7rem;white-space:pre-wrap;word-wrap:break-word;"
+          "\">%s</pre>", cli_out);
+
+    /* Import: paste a dump back. id=bfimp so the page's submit interceptor
+     * leaves it alone - that interceptor rewrites forms into GET query strings,
+     * and a frame dump does not fit in a URI. */
+    A("<div style=\"margin:6px auto;max-width:420px;\">"
+      "<form id=\"bfimp\" onsubmit=\"return importBf(this)\">"
+      "<textarea name=\"c\" rows=\"5\" style=\"width:98%%;font-size:0.68rem;\" "
+      "placeholder=\"paste a Dump C code block (or hardcode_backflip_angle.h) "
+      "here and press Import\"></textarea>"
+      "<button type=\"submit\" style=\"width:100%%;height:32px;\">"
+      "&#128229; Import frames</button></form></div>");
+
+    if(bf_count > 0){
+        A("<table style=\"margin:6px auto;font-size:0.78rem;border-collapse:collapse;\">"
+          "<tr><th>frame</th><th>move ms</th><th>delay ms</th><th></th><th></th></tr>");
+        for(int f=0; f<bf_count; f++){
+            A("<tr%s><td>%d%s</td>"
+              "<td><form action=\"/bfmove\" style=\"display:inline;\">"
+              "<input type=\"hidden\" name=\"f\" value=\"%d\">"
+              "<input name=\"ms\" value=\"%u\" size=\"5\" inputmode=\"numeric\">"
+              "<button type=\"submit\">set</button></form></td>"
+              "<td><form action=\"/bfmove\" style=\"display:inline;\">"
+              "<input type=\"hidden\" name=\"f\" value=\"%d\">"
+              "<input name=\"dly\" value=\"%u\" size=\"5\" inputmode=\"numeric\">"
+              "<button type=\"submit\">set</button></form></td>"
+              "<td><a href=\"/bfgoto?f=%d\">go</a></td>"
+              "<td><a href=\"/bfsetref?f=%d\">ref</a></td></tr>",
+              f==bf_ref_idx ? " style=\"background:#2c3e50;\"" : "",
+              f, f==bf_ref_idx ? " *" : "",
+              f, (unsigned)bf_move_ms[f], f, (unsigned)bf_delay_ms[f], f, f);
+
+            /* The angles themselves, in exactly the form the pose / pose_bf
+             * boxes take, so a frame can be copied into either without any
+             * arithmetic: absolute SCS for `pose`, delta-from-reference for
+             * `pose_bf`. Without this the table says a frame exists but not
+             * what it is, which is no use for editing one movement.
+             *
+             * Capped: each of these costs ~250 bytes and the whole page shares
+             * one ROOT_BUF_SZ buffer with the CLI output. Past the cap the A()
+             * macro would just truncate, and a silently half-rendered page is
+             * the same "I cannot see it" bug in a new place. The selected frame
+             * is always shown, however far down the list it is. */
+            if(f < BF_DETAIL_ROWS || f == verify_idx){
+                A("<tr><td colspan=\"5\" style=\"text-align:left;padding:1px 6px;\">"
+                  "<code style=\"color:#6cf;\">pose </code><code>");
+                for(int i=1;i<=12;i++) A("%d%s", (int)bf_frames[f][i], i<12?",":"");
+                A("</code><br><code style=\"color:#fc6;\">pose_bf </code><code>");
+                for(int i=1;i<=12;i++)
+                    A("%d%s", (int)bf_frames[f][i]-(int)bf_ref[i], i<12?",":"");
+                A("</code></td></tr>");
+            }else if(f == BF_DETAIL_ROWS){
+                A("<tr><td colspan=\"5\" style=\"font-size:0.7rem;color:#888;\">"
+                  "angles hidden past frame %d - press <b>go</b> to select a "
+                  "frame and its angles appear</td></tr>", BF_DETAIL_ROWS-1);
+            }
+        }
+        A("</table>");
+    }
+
+    /* ---- pose / pose_bf without a serial terminal ----------------------- */
+    A("<div style=\"margin:6px auto;font-size:0.8rem;\">"
+      "<form action=\"/wpose\" style=\"margin:4px;\">pose (12 absolute SCS): "
+      "<input name=\"v\" size=\"40\" placeholder=\"511,511,511,...\" "
+      "autocomplete=\"off\"><button type=\"submit\">go</button></form>"
+      "<form action=\"/wposebf\" style=\"margin:4px;\">pose_bf (12 deltas from ref): "
+      "<input name=\"v\" size=\"40\" placeholder=\"0,-30,40,...\" "
+      "autocomplete=\"off\"><button type=\"submit\">go</button></form></div>");
     A("<div style=\"margin:8px auto;\"><button class=\"twerk-btn %s\" type=\"button\" "
       "style=\"background:#2980b9;\"><a href=\"/testspeed\" style=\"color:white;\">&#9881; Test Speed</a>"
       "</button></div>", ON(TestSpeed));
@@ -1828,8 +1948,13 @@ static esp_err_t send_root(httpd_req_t *req){
       "var h=a.getAttribute('href');if(!h||h.charAt(0)!='/')return;"
       "e.preventDefault();"
       "fetch(h).then(function(r){return r.text();}).then(swapBody);});"
+      // POST the pasted dump as a raw body, then swap in the new page.
+      "function importBf(f){"
+      "fetch('/bfimport',{method:'POST',body:f.c.value})"
+      ".then(function(r){return r.text();}).then(swapBody);"
+      "return false;}"
       "document.addEventListener('submit',function(e){"
-      "var f=e.target;if(f.id=='clif')return;"   // CLI form has its own AJAX
+      "var f=e.target;if(f.id=='clif'||f.id=='bfimp')return;"  // own AJAX handlers
       "e.preventDefault();"
       "var p=new URLSearchParams(new FormData(f)).toString();"
       "fetch(f.getAttribute('action')+'?'+p).then(function(r){return r.text();})"
@@ -2102,6 +2227,433 @@ static void load_current_flip(void){
         printf("  WARNING: %d value(s) clamped at a servo limit -- "
                "regenerate with a lower --scale\n", current_flip_clamped);
 }
+/* ---- Backflip20: play backflip20.h with LINEAR interpolation ---------------
+ *
+ * Deliberately not routed through the trace / Play machinery. interp_to() eases
+ * with a smoothstep, which arrives at every frame with ZERO velocity: on a
+ * 19-knot trajectory that is nineteen separate little moves with a dead stop
+ * between each. The angles come out right and the motion does not.
+ *
+ * Linear interpolation carries velocity through each frame boundary, which is
+ * what the host-side play_slow.py does - and that is the version that moved
+ * correctly on this robot. Same table, same result.
+ *
+ * BF20_COUNTS holds IDEAL counts (511 == the 70 mm stand); offset[] is added
+ * here, so recalibrating never invalidates the table. */
+#define BF20_STEP_MS 20      /* command interval; servo_flush() floors at 5 ms */
+
+static void backflip20_run(volatile int *active)
+{
+    printf("backflip20: %s, %d frames\n", BF20_SOURCE, BF20_FRAMES);
+
+    uint16_t prev[13];
+    for(int i=1;i<=12;i++) prev[i] = goal[i];
+
+    for(int f=0; f<BF20_FRAMES && (!active || *active); f++){
+        /* Target for this frame, with the live calibration folded in.
+         *
+         * The four ABDUCTION servos (1/4/7/10) are deliberately left alone. The
+         * planner locks abduction at zero and never produces data for it, so
+         * the table carries a placeholder 511 for those columns - and 511 is
+         * not where they sit on this robot (a taught frame reads them near 50).
+         * Commanding the placeholder would swing all four hips through ~120 deg
+         * that the trajectory never asked for. play_slow.py, the version that
+         * was verified on the robot, writes only the eight leg servos; this
+         * matches it. */
+        uint16_t tgt[13];
+        for(int i=1;i<=12;i++){
+            if(i==1 || i==4 || i==7 || i==10){ tgt[i] = goal[i]; continue; }
+            int v = (int)BF20_COUNTS[f][i] + (int)(offset[i]/0.263f);
+            if(v < 0)    v = 0;
+            if(v > 1023) v = 1023;
+            tgt[i] = (uint16_t)v;
+        }
+
+        int mv = BF20_MOVE_MS[f];
+        if(mv < 1) mv = 1;
+        uint32_t t0 = millis(), tim;
+        while((tim = millis()-t0) < (uint32_t)mv){
+            if(active && !*active) break;
+            /* LINEAR, not smoothstep - this is the whole point. */
+            for(int i=1;i<=12;i++)
+                goal[i] = (uint16_t)((int)prev[i] +
+                          ((int)tgt[i]-(int)prev[i]) * (int)tim / mv);
+            servo_flush();
+            if(BF20_STEP_MS > 5) vTaskDelay(pdMS_TO_TICKS(BF20_STEP_MS-5));
+        }
+        for(int i=1;i<=12;i++){ goal[i] = tgt[i]; prev[i] = tgt[i]; }
+        servo_flush();
+
+        if(BF20_DELAY_MS[f] > 0) dwell_ms(BF20_DELAY_MS[f], active);
+    }
+
+    /* Settle back on the stand and hold it. */
+    uint16_t ini[13]; fill_ini_frame(ini);
+    interp_to(ini, 900, active);
+    for(int i=1;i<=12;i++) hold_frame[i]=ini[i];
+    HoldPose = 1;
+}
+
+static esp_err_t h_backflip20(httpd_req_t*r){
+    reset_all_modes(); started_once=1; Backflip20=1; return send_root(r);
+}
+
+/* Copy backflip20.h into the trace buffer so the existing Verify < > cursor can
+ * step it one frame at a time. Same offset[] handling as backflip20_run(), so a
+ * frame inspected here is the frame that will play.
+ *
+ * Stepping is how you decide what to cut: walk the frames, note the indices that
+ * are not doing anything, delete those ROWS from the _bf20.csv and regenerate.
+ * Note that Play from the trace uses the smoothstep interp_to() and will stop at
+ * every frame - for the real motion use the Backflip20 button, which does not. */
+static void load_bf20(void){
+    int nf = BF20_FRAMES < MAX_FRAMES ? BF20_FRAMES : MAX_FRAMES;
+    uint16_t ini[13]; fill_ini_frame(ini);
+    for(int f=0; f<nf; f++){
+        for(int id=1; id<=12; id++){
+            /* Abduction is a placeholder in the table - hold the stance value,
+             * same reasoning as in backflip20_run(). */
+            if(id==1 || id==4 || id==7 || id==10){ rec_frames[f][id] = ini[id]; continue; }
+            int v = (int)BF20_COUNTS[f][id] + (int)(offset[id]/0.263f);
+            if(v < 0)    v = 0;
+            if(v > 1023) v = 1023;
+            rec_frames[f][id] = (uint16_t)v;
+        }
+        frame_move_ms[f]  = BF20_MOVE_MS[f];
+        frame_delay_ms[f] = BF20_DELAY_MS[f];
+    }
+    rec_count = nf;
+    verify_idx = 0;
+    use_frame_timing = 1;
+    printf("backflip20: %d frames -> trace. Use Verify < > to step them.\n", nf);
+}
+static esp_err_t h_bf20load(httpd_req_t*r){ reset_all_modes(); load_bf20(); return send_root(r); }
+
+/* ============ teach-backflip, from the web instead of the serial CLI ========
+ * Same buffers and the same capture arithmetic as the `teach_backflip`/`rec_bf`
+ * commands - these are additional front doors onto them, not a second
+ * implementation, so a pose taught here and one taught over serial are the
+ * same pose.
+ *
+ * The one thing the CLI never had is per-frame timing you can edit after the
+ * fact: bf_move_ms[]/bf_delay_ms[] are set to sensible defaults on capture and
+ * changed with /bfmove, so you can teach the shape first and tune the speed of
+ * each individual movement afterwards without re-teaching anything.
+ */
+static int q_int(httpd_req_t*r, const char*key, int def){
+    char q[192], v[16];
+    if(httpd_req_get_url_query_str(r,q,sizeof q)==ESP_OK &&
+       httpd_query_key_value(q,key,v,sizeof v)==ESP_OK) return atoi(v);
+    return def;
+}
+
+/* Toggle limp mode. Pressing it again after teaching re-enters teach without
+ * clearing what is already recorded - "just re-teach" means adding to or
+ * replacing frames, not starting over, so nothing is destroyed here. */
+static esp_err_t h_bfteach(httpd_req_t*r){
+    started_once = 1;
+    if(Relax){ Relax = 0; reset_all_modes(); }
+    else     { reset_all_modes(); Relax = 1; }
+    return send_root(r);
+}
+
+static esp_err_t h_bfrec(httpd_req_t*r){
+    if(!Relax || bf_count >= MAX_FRAMES) return send_root(r);
+    for(int i=1; i<=12; i++){
+        /* Present position is reported on the opposite scale to the command
+         * (driver_board.c flips on write but not on read), hence 1023 - x.
+         * Identical to the rec_bf command. */
+        int cmd = 1023 - (int)driver_board_present_position(i);
+        if(cmd < 0)    cmd = 0;
+        if(cmd > 1023) cmd = 1023;
+        if(bf_count == bf_ref_idx) bf_ref[i] = (uint16_t)cmd;
+        bf_frames[bf_count][i] = (uint16_t)cmd;
+    }
+    bf_move_ms[bf_count]  = (uint16_t)(bf_count == 0 ? 800 : 200);
+    bf_delay_ms[bf_count] = (uint16_t)(bf_count == 0 ? 300 : 0);
+    bf_count++;
+    return send_root(r);
+}
+
+static esp_err_t h_bfdel(httpd_req_t*r){
+    if(bf_count > 0) bf_count--;
+    if(bf_ref_idx >= bf_count) bf_ref_idx = bf_count > 0 ? bf_count-1 : 0;
+    return send_root(r);
+}
+static esp_err_t h_bfclear(httpd_req_t*r){ bf_count = 0; bf_ref_idx = 0; return send_root(r); }
+
+/* Jump to a taught frame.
+ *
+ * NOT start_goto(): that one indexes rec_frames[] and clamps to rec_count, i.e.
+ * whatever trace happens to be loaded. If the taught frames have not been
+ * pushed into the trace - or a different trace is loaded, like backflip20's 9 -
+ * then "go" on frame 2 or 3 silently clamps and appears to do nothing. This
+ * reads bf_frames[] directly, so it works the moment a frame is recorded.
+ *
+ * It also deliberately restores teach mode afterwards if it was on: GotoPose
+ * needs the servos powered to move there, but dropping out of teach on every
+ * inspection would mean re-enabling it before each new capture. */
+static esp_err_t h_bfgoto(httpd_req_t*r){
+    int f = q_int(r, "f", -1);
+    if(f < 0 || f >= bf_count) return send_root(r);
+    reset_all_modes();
+    for(int i=1;i<=12;i++) pose_target[i] = bf_frames[f][i];
+    verify_idx = f;
+    started_once = 1;
+    GotoPose = 1;
+    return send_root(r);
+}
+
+/* Choose which taught frame is the reference the deltas are measured from. */
+static esp_err_t h_bfsetref(httpd_req_t*r){
+    int f = q_int(r, "f", 0);
+    if(f >= 0 && f < bf_count){
+        bf_ref_idx = f;
+        for(int i=1;i<=12;i++) bf_ref[i] = bf_frames[f][i];
+    }
+    return send_root(r);
+}
+
+/* /bfmove?f=N&ms=X&dly=Y - retime one movement without re-teaching it. */
+static esp_err_t h_bfmove(httpd_req_t*r){
+    int f = q_int(r, "f", -1);
+    int ms = q_int(r, "ms", -1);
+    int dly = q_int(r, "dly", -1);
+    if(f >= 0 && f < bf_count){
+        if(ms  >= 1) bf_move_ms[f]  = (uint16_t)(ms  > 20000 ? 20000 : ms);
+        if(dly >= 0) bf_delay_ms[f] = (uint16_t)(dly > 20000 ? 20000 : dly);
+    }
+    return send_root(r);
+}
+
+/* Push the taught frames into the trace so Verify < > and Play work on them. */
+static void load_bf_taught(void){
+    for(int f=0; f<bf_count; f++){
+        for(int id=1; id<=12; id++) rec_frames[f][id] = bf_frames[f][id];
+        frame_move_ms[f]  = bf_move_ms[f]  ? bf_move_ms[f]  : play_ms;
+        frame_delay_ms[f] = bf_delay_ms[f];
+    }
+    rec_count = bf_count; verify_idx = 0; use_frame_timing = 1;
+}
+/* Named h_bftaughtload, not h_bfload: /bfload is already taken by the loader
+ * for the 28 compiled-in optimised poses. */
+static esp_err_t h_bftaughtload(httpd_req_t*r){
+    reset_all_modes(); load_bf_taught(); return send_root(r);
+}
+static esp_err_t h_bfreplay(httpd_req_t*r){
+    if(bf_count < 1) return send_root(r);
+    reset_all_modes(); load_bf_taught(); started_once=1; Play=1; return send_root(r);
+}
+
+/* Same C as `recdump_bf` prints on serial, into the page's output pane so it
+ * can be copied without a terminal attached. */
+static esp_err_t h_bfdump(httpd_req_t*r){
+    cli_out[0] = 0;
+    if(bf_count < 1){ cli_printf("no frames taught yet\n"); return send_root(r); }
+    cli_printf("// === paste into hardcode_backflip_angle.h ===\n");
+    cli_printf("#define BF3_FRAMES %d\n\n", bf_count);
+    cli_printf("static const uint16_t BF3_REF[13] = {\n             0,");
+    for(int i=1;i<=12;i++) cli_printf(" %4u%s", (unsigned)bf_ref[i], i<12?",":"");
+    cli_printf("\n};\n\n");
+    if(bf_count > 1){
+        cli_printf("static const int16_t BF3_DELTA[%d][13] = {\n", bf_count-1);
+        for(int f=1; f<bf_count; f++){
+            cli_printf("    {0");
+            for(int i=1;i<=12;i++)
+                cli_printf(", %5d", (int)bf_frames[f][i] - (int)bf_ref[i]);
+            cli_printf("},  /* frame %d */\n", f);
+        }
+        cli_printf("};\n");
+    }
+    cli_printf("static const uint16_t BF3_MOVE_MS[%d] = {", bf_count);
+    for(int f=0; f<bf_count; f++) cli_printf(" %u%s", (unsigned)bf_move_ms[f], f<bf_count-1?",":"");
+    cli_printf(" };\nstatic const uint16_t BF3_DELAY_MS[%d] = {", bf_count);
+    for(int f=0; f<bf_count; f++) cli_printf(" %u%s", (unsigned)bf_delay_ms[f], f<bf_count-1?",":"");
+    cli_printf(" };\n// === end ===\n");
+    return send_root(r);
+}
+
+/* ---- Import: paste a Dump back in and it becomes the taught frames --------
+ *
+ * The counterpart to /bfdump, so the pair is a real export/import round trip:
+ * dump, keep the text anywhere, paste it back later and the frames are exactly
+ * where they were. That matters because the taught buffer is RAM only - a
+ * reflash, a power cycle or a dropped link loses it.
+ *
+ * Parsing ignores the C entirely and just reads integers in order, after
+ * blanking comments (a `/ * frame 1 * /` marker would otherwise be scanned as
+ * the number 1). It accepts anything shaped like the dump, so a hand-edited
+ * hardcode_backflip_angle.h pastes in as readily as the button's own output. */
+static void strip_c_comments(char *s){
+    char *w = s;
+    for(char *p = s; *p; ){
+        if(p[0]=='/' && p[1]=='*'){
+            p += 2;
+            while(*p && !(p[0]=='*' && p[1]=='/')) p++;
+            if(*p) p += 2;
+        }else if(p[0]=='/' && p[1]=='/'){
+            while(*p && *p != '\n') p++;
+        }else{
+            *w++ = *p++;
+        }
+    }
+    *w = 0;
+}
+
+/* Read up to n integers starting at *pp. Returns how many were found. */
+static int read_ints(const char **pp, int *dst, int n){
+    const char *p = *pp;
+    int got = 0;
+    while(got < n && *p){
+        while(*p && *p != '-' && (*p < '0' || *p > '9')) p++;
+        if(!*p) break;
+        char *end;
+        long v = strtol(p, &end, 10);
+        if(end == p) break;
+        dst[got++] = (int)v;
+        p = end;
+    }
+    *pp = p;
+    return got;
+}
+
+/* Find `tok`, then step past the '{' that opens its initialiser. Without the
+ * brace step the "13" in `BF3_REF[13] = {` would be read as the first value. */
+static const char *find_array(const char *s, const char *tok){
+    const char *p = strstr(s, tok);
+    if(!p) return NULL;
+    p = strchr(p, '{');
+    return p ? p + 1 : NULL;
+}
+
+static esp_err_t h_bfimport(httpd_req_t*r){
+    int total = r->content_len;
+    cli_out[0] = 0;
+    if(total <= 0 || total > 24000){
+        cli_printf("import: body is %d bytes (need 1..24000)\n", total);
+        return send_root(r);
+    }
+    char *body = malloc(total + 1);
+    if(!body){ cli_printf("import: out of memory\n"); return send_root(r); }
+
+    int got = 0;
+    while(got < total){
+        int k = httpd_req_recv(r, body + got, total - got);
+        if(k <= 0){ free(body); cli_printf("import: receive failed\n");
+                    return send_root(r); }
+        got += k;
+    }
+    body[total] = 0;
+    strip_c_comments(body);
+
+    /* Frame count. Accept the #define, or fall back to counting DELTA rows. */
+    int n = 0;
+    const char *p = strstr(body, "BF3_FRAMES");
+    if(p){ p += strlen("BF3_FRAMES"); read_ints(&p, &n, 1); }
+    if(n < 1 || n > MAX_FRAMES){
+        free(body);
+        cli_printf("import: BF3_FRAMES missing or out of range (got %d)\n", n);
+        return send_root(r);
+    }
+
+    int ref[13], mv[MAX_FRAMES], dl[MAX_FRAMES];
+    const char *q = find_array(body, "BF3_REF");
+    if(!q || read_ints(&q, ref, 13) != 13){
+        free(body); cli_printf("import: BF3_REF needs 13 values\n");
+        return send_root(r);
+    }
+
+    /* Deltas straight into the frame buffer, so a failure part-way cannot
+     * leave the live taught set half-overwritten with someone else's frames. */
+    static uint16_t tmp[MAX_FRAMES][13];
+    for(int i=1;i<=12;i++) tmp[0][i] = (uint16_t)(ref[i] < 0 ? 0 :
+                                                  ref[i] > 1023 ? 1023 : ref[i]);
+    if(n > 1){
+        const char *d = find_array(body, "BF3_DELTA");
+        if(!d){ free(body); cli_printf("import: BF3_DELTA not found\n");
+                return send_root(r); }
+        for(int f=1; f<n; f++){
+            int row[13];
+            if(read_ints(&d, row, 13) != 13){
+                free(body);
+                cli_printf("import: BF3_DELTA has fewer than %d rows\n", n-1);
+                return send_root(r);
+            }
+            for(int i=1;i<=12;i++){
+                int v = ref[i] + row[i];
+                if(v < 0)    v = 0;
+                if(v > 1023) v = 1023;
+                tmp[f][i] = (uint16_t)v;
+            }
+        }
+    }
+
+    /* Timing is optional - an older dump without it still imports. */
+    for(int f=0; f<n; f++){ mv[f] = f==0 ? 800 : 200; dl[f] = f==0 ? 300 : 0; }
+    const char *m = find_array(body, "BF3_MOVE_MS");
+    if(m) read_ints(&m, mv, n);
+    const char *y = find_array(body, "BF3_DELAY_MS");
+    if(y) read_ints(&y, dl, n);
+
+    for(int f=0; f<n; f++){
+        for(int i=1;i<=12;i++) bf_frames[f][i] = tmp[f][i];
+        bf_move_ms[f]  = (uint16_t)(mv[f] < 1 ? 1 : mv[f] > 20000 ? 20000 : mv[f]);
+        bf_delay_ms[f] = (uint16_t)(dl[f] < 0 ? 0 : dl[f] > 20000 ? 20000 : dl[f]);
+    }
+    for(int i=1;i<=12;i++) bf_ref[i] = tmp[0][i];
+    bf_count = n;
+    bf_ref_idx = 0;
+
+    free(body);
+    cli_printf("import: %d frames loaded. Press Replay, or go to a frame.\n", n);
+    return send_root(r);
+}
+
+/* /wpose?v=a,b,...,l  - the `pose` command. Absolute SCS, all 12. */
+static esp_err_t h_wpose(httpd_req_t*r){
+    char q[256], v[192];
+    if(httpd_req_get_url_query_str(r,q,sizeof q)!=ESP_OK ||
+       httpd_query_key_value(q,"v",v,sizeof v)!=ESP_OK) return send_root(r);
+    int val[13]; int n=0; char *sp=NULL;
+    for(char *tk=strtok_r(v," ,\t",&sp); tk && n<12; tk=strtok_r(NULL," ,\t",&sp)){
+        int s = atoi(tk);
+        if(s < 0)    s = 0;
+        if(s > 1023) s = 1023;
+        val[++n] = s;
+    }
+    if(n != 12){ cli_out[0]=0; cli_printf("pose: need 12 values, got %d\n", n);
+                 return send_root(r); }
+    reset_all_modes();
+    for(int i=1;i<=12;i++) pose_target[i] = (uint16_t)val[i];
+    started_once = 1; GotoPose = 1;
+    return send_root(r);
+}
+
+/* /wposebf?v=d1,...,d12 - the `pose_bf` command: deltas from the reference. */
+static esp_err_t h_wposebf(httpd_req_t*r){
+    char q[256], v[192];
+    if(httpd_req_get_url_query_str(r,q,sizeof q)!=ESP_OK ||
+       httpd_query_key_value(q,"v",v,sizeof v)!=ESP_OK) return send_root(r);
+    int d[13]; int n=0; char *sp=NULL;
+    for(char *tk=strtok_r(v," ,\t",&sp); tk && n<12; tk=strtok_r(NULL," ,\t",&sp)){
+        d[++n] = atoi(tk);
+    }
+    if(n != 12){ cli_out[0]=0; cli_printf("pose_bf: need 12 deltas, got %d\n", n);
+                 return send_root(r); }
+    /* Apply to whatever is currently serving as the reference: the taught one
+     * if anything has been taught, otherwise the compiled-in BF3_REF. */
+    reset_all_modes();
+    for(int i=1;i<=12;i++){
+        int base = bf_count > 0 ? (int)bf_ref[i] : (int)BF3_REF[i];
+        int s = base + d[i];
+        if(s < 0)    s = 0;
+        if(s > 1023) s = 1023;
+        pose_target[i] = (uint16_t)s;
+    }
+    started_once = 1; GotoPose = 1;
+    return send_root(r);
+}
+
 static esp_err_t h_fliploadr(httpd_req_t*r){ reset_all_modes(); load_current_flip(); return send_root(r); }
 static esp_err_t h_flipplay(httpd_req_t*r){ reset_all_modes(); load_current_flip(); started_once=1; Play=1; return send_root(r); }
 
@@ -2502,11 +3054,22 @@ static void reg(httpd_handle_t s,const char*uri,esp_err_t(*h)(httpd_req_t*)){
     httpd_uri_t u={.uri=uri,.method=HTTP_GET,.handler=h};
     httpd_register_uri_handler(s,&u);
 }
+/* POST variant. Needed for the frame import: the page's submit interceptor
+ * turns every form into a GET query string, and a full frame dump does not fit
+ * in a URI. */
+static void reg_post(httpd_handle_t s,const char*uri,esp_err_t(*h)(httpd_req_t*)){
+    httpd_uri_t u={.uri=uri,.method=HTTP_POST,.handler=h};
+    httpd_register_uri_handler(s,&u);
+}
 
 static void start_webserver(void){
     httpd_handle_t s=NULL;
     httpd_config_t cfg=HTTPD_DEFAULT_CONFIG();
-    cfg.max_uri_handlers=110;   // base + teach/record + 24 calibration handlers
+    /* 95 static routes + 24 generated /calNM|/calNP = 119. The teach-backflip
+     * and pose routes pushed this past the old 110, and reg() ignores the
+     * registration failure, so the overflow would have shown up as a handful of
+     * buttons silently 404ing rather than as an error. */
+    cfg.max_uri_handlers=140;   // base + teach/record + 24 calibration handlers
     cfg.stack_size=8192;
     cfg.core_id = 0;
     cfg.lru_purge_enable=true;
@@ -2519,6 +3082,17 @@ static void start_webserver(void){
     reg(s,"/right",h_right); reg(s,"/turnL",h_turnL); reg(s,"/turnR",h_turnR);
     reg(s,"/twerk",h_twerk); reg(s,"/jump",h_jump); reg(s,"/jumpfwd",h_jumpfwd); reg(s,"/testspeed",h_testspeed);
     reg(s,"/backflip",h_backflip);
+    reg(s,"/backflip20",h_backflip20);   // linear-interp playback of backflip20.h
+    reg(s,"/bf20load",h_bf20load);       // load backflip20.h into the Verify trace
+    /* teach-backflip from the browser (same buffers as the serial commands) */
+    reg(s,"/bfteach",h_bfteach);   reg(s,"/bfrec",h_bfrec);
+    reg(s,"/bfdel",h_bfdel);       reg(s,"/bfclear",h_bfclear);
+    reg(s,"/bfsetref",h_bfsetref); reg(s,"/bfmove",h_bfmove);
+    reg(s,"/bfgoto",h_bfgoto);
+    reg(s,"/bftaughtload",h_bftaughtload); reg(s,"/bfreplay",h_bfreplay);
+    reg(s,"/bfdump",h_bfdump);
+    reg_post(s,"/bfimport",h_bfimport);   // paste a dump back in (POST: too big for a URI)
+    reg(s,"/wpose",h_wpose);       reg(s,"/wposebf",h_wposebf);
     reg(s,"/mate",h_mate);
     reg(s,"/stanford",h_stanford);
     reg(s,"/relax",h_relax);       reg(s,"/rec",h_rec);
@@ -2743,6 +3317,11 @@ static void gait_task(void *arg){
                 HoldPose = 1;
             }
             Play = 0;
+
+        }else if(Backflip20){
+            cur_override_mA = 0;
+            backflip20_run(&Backflip20);
+            Backflip20 = 0;
 
         }else if(GotoPose){
             // Move to a single SCS pose typed in via the 'pose' command, then
