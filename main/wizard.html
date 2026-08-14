@@ -56,7 +56,8 @@ button{font-family:inherit;}
 /* ================= layout ================= */
 #main{flex:1;display:flex;min-height:0;padding:12px;gap:12px;}
 /* ---- left tree ---- */
-#tree{width:222px;background:var(--panel);border:1px solid var(--line);
+/* 252px (was 222): the per-servo NTC badge needs the extra room */
+#tree{width:252px;background:var(--panel);border:1px solid var(--line);
       border-radius:14px;overflow-y:auto;padding:10px 8px;flex-shrink:0;
       box-shadow:var(--shadow);}
 #tree .logo{padding:4px 10px 10px;border-bottom:1px solid var(--line);margin-bottom:6px;}
@@ -71,8 +72,8 @@ button{font-family:inherit;}
 #tree .grp .arr{color:var(--dim);}
 #tree .grp::before{content:"";width:7px;height:7px;border-radius:2px;background:var(--gc,#2563eb);}
 #tree .sv{margin-left:26px;}
-#tree .sv{padding:7px 11px;cursor:pointer;white-space:nowrap;border-radius:9px;
-      margin:1px 2px;display:flex;align-items:center;gap:9px;color:#374151;
+#tree .sv{padding:7px 9px;cursor:pointer;white-space:nowrap;border-radius:9px;
+      margin:1px 2px;display:flex;align-items:center;gap:7px;color:#374151;
       transition:background .15s,transform .1s;}
 #tree .sv:hover{background:var(--raise);transform:translateX(2px);}
 #tree .sv.sel{background:var(--grad);color:#fff;font-weight:600;
@@ -83,6 +84,52 @@ button{font-family:inherit;}
 #tree .sv.sel .tag{background:rgba(255,255,255,.25);color:#fff;}
 #tree .sv.miss{opacity:.35;}
 #tree .sv.miss .tag{color:var(--mut);}
+/* NTC temperature badge on each servo in the tree.
+   Colour bands: <40 cool, 40-54 warm, 55-69 hot, >=70 critical. */
+#tree .sv .lbl{flex:1;overflow:hidden;text-overflow:ellipsis;}
+#tree .sv .tc{margin-left:auto;flex-shrink:0;border-radius:7px;font-size:9.5px;
+      font-weight:700;padding:2px 5px;min-width:40px;text-align:right;
+      font-variant-numeric:tabular-nums;background:#eef2f7;color:var(--dim);
+      transition:background .3s,color .3s;}
+#tree .sv .tc.t0{background:#e0f2fe;color:#0369a1;}   /* cool     */
+#tree .sv .tc.t1{background:#dcfce7;color:#15803d;}   /* normal   */
+#tree .sv .tc.t2{background:#fef3c7;color:#b45309;}   /* warm     */
+#tree .sv .tc.t3{background:#ffedd5;color:#c2410c;}   /* hot      */
+#tree .sv .tc.t4{background:#fee2e2;color:#b91c1c;animation:hotpulse 1.1s infinite;}
+/* implausible reading = sensor / link fault, not a temperature */
+#tree .sv .tc.err,#thermo .c.err{background:#f3e8ff !important;color:#7e22ce !important;
+      animation:none !important;font-size:8.5px;}
+#tree .sv.sel .tc{background:rgba(255,255,255,.25);color:#fff;}
+/* ...but a hot/critical servo keeps its warning colour even when selected,
+   otherwise the one servo you are looking at is the one that stops warning */
+#tree .sv.sel .tc.t3{background:#fff;color:#c2410c;}
+#tree .sv.sel .tc.t4{background:#fff;color:#b91c1c;}
+@keyframes hotpulse{0%,100%{opacity:1;}50%{opacity:.45;}}
+/* temperature meter fill: colour is set from JS, so no fixed gradient here */
+#mtempf{background:linear-gradient(90deg,#38bdf8,#0284c7);}
+#mtemp.hot{color:#b91c1c;font-weight:700;}
+/* whole-robot thermal strip under the tree */
+#thermo{margin-top:8px;padding:8px 6px 4px;border-top:1px solid var(--line);}
+#thermo .th{font-size:9.5px;font-weight:700;letter-spacing:1.2px;color:var(--dim);
+      text-transform:uppercase;display:flex;justify-content:space-between;
+      align-items:center;margin-bottom:7px;}
+#thermo .th span{letter-spacing:0;text-transform:none;font-weight:600;color:var(--mut);}
+/* 1 label column + one column per leg/driver board */
+#thermo .cells{display:grid;grid-template-columns:30px repeat(4,1fr);gap:3px;
+      align-items:center;}
+#thermo .hd,#thermo .rl{font-size:8.5px;font-weight:700;color:var(--dim);
+      text-align:center;letter-spacing:.4px;}
+#thermo .rl{text-align:left;padding-left:1px;}
+#thermo .c{height:22px;border-radius:5px;background:#eef2f7;color:var(--dim);
+      font-size:9px;font-weight:700;display:flex;align-items:center;
+      justify-content:center;font-variant-numeric:tabular-nums;cursor:pointer;
+      transition:background .3s,color .3s;}
+#thermo .c.t0{background:#e0f2fe;color:#0369a1;}
+#thermo .c.t1{background:#dcfce7;color:#15803d;}
+#thermo .c.t2{background:#fef3c7;color:#b45309;}
+#thermo .c.t3{background:#ffedd5;color:#c2410c;}
+#thermo .c.t4{background:#fee2e2;color:#b91c1c;animation:hotpulse 1.1s infinite;}
+#thermo .c.sel{outline:2px solid var(--acc);outline-offset:1px;}
 /* ---- center ---- */
 #mid{flex:1;overflow:auto;background:var(--panel);border:1px solid var(--line);
      border-radius:14px;min-width:340px;box-shadow:var(--shadow);}
@@ -337,6 +384,8 @@ table.sat td.st.ok{color:var(--ok);} table.sat td.st.err{color:var(--bad);}
         <div class="mbar"><div id="mcurf"></div></div></div>
       <div class="meter"><div class="mlab">PWM Duty <span id="mduty">&mdash;</span></div>
         <div class="mbar"><div id="mdutyf"></div></div></div>
+      <div class="meter"><div class="mlab">NTC Temp <span id="mtemp">&mdash;</span></div>
+        <div class="mbar"><div id="mtempf"></div></div></div>
       <div class="bd">
         <table class="lv"><tbody>
           <tr><td>Position</td><td id="lv_pos">&mdash; [&deg;]</td></tr>
@@ -345,6 +394,7 @@ table.sat td.st.ok{color:var(--ok);} table.sat td.st.err{color:var(--bad);}
           <tr><td>Current</td><td id="lv_cur">&mdash; [mA]</td></tr>
           <tr><td>Current Cap</td><td id="lv_cap">&mdash; [mA]</td></tr>
           <tr><td>PWM Duty</td><td id="lv_duty">&mdash; [%]</td></tr>
+          <tr><td>NTC Temp</td><td id="lv_temp">&mdash; [&deg;C]</td></tr>
           <tr><td>Mode</td><td id="lv_mode">&mdash;</td></tr>
         </tbody></table>
       </div>
@@ -428,8 +478,32 @@ var LIVE=[
  {k:"pos_adc", a:107,name:"Position ADC (raw)",unit:"",dp:0},
  {k:"cur_adc", a:108,name:"Current ADC (raw)",unit:"",dp:0},
  {k:"mode",    a:109,name:"Operating Mode",unit:"",dp:0},
- {k:"loop",    a:110,name:"Loop Counter",unit:"",dp:0}
+ {k:"loop",    a:110,name:"Loop Counter",unit:"",dp:0},
+ {k:"temp_c",  a:111,name:"NTC Temperature",unit:"°C",dp:1}
 ];
+/* NTC colour bands, degC. Feetech-class hobby servos start losing torque
+   around 60 °C and the coil insulation is the limit past ~80 °C, so treat
+   70 as "back off now". Tweak TEMP_BANDS if your build runs hotter. */
+var TEMP_BANDS=[30,40,55,70];      /* -> classes t0 t1 t2 t3 t4 */
+var TEMP_MIN=20, TEMP_MAX=85;      /* meter bar scale           */
+/* Plausibility window. A 10k/B3380 NTC on a servo cannot physically read
+ * outside this, so anything beyond it is a bad frame or a dead sensor -
+ * show it as a FAULT rather than rendering a number that looks real.
+ * (A shorted/open NTC makes the AT32's beta equation saturate near
+ * +847 C / far negative, so those land here too and read as ERR.) */
+var TEMP_LO=-40, TEMP_HI=150;
+function tOK(c){
+  return c!==null && c!==undefined && !isNaN(c) && c>=TEMP_LO && c<=TEMP_HI;
+}
+function tBand(c){
+  if(!tOK(c)) return -1;
+  for(var i=0;i<TEMP_BANDS.length;i++) if(c<TEMP_BANDS[i]) return i;
+  return TEMP_BANDS.length;
+}
+function tColor(c){
+  return ["#0284c7","#16a34a","#d97706","#ea580c","#dc2626"][tBand(c)]||"#94a3b8";
+}
+function tClass(c){ var b=tBand(c); return b<0?"":("t"+b); }
 var LEGS=[["Front Right",1,"#2563eb"],["Front Left",4,"#16a34a"],
           ["Rear Right",7,"#9333ea"],["Rear Left",10,"#dc2626"]];
 var JOINT=["Hip","Thigh","Calf"];
@@ -455,10 +529,30 @@ function buildTree(){
     for(var j=0;j<3;j++){
       var id=g[1]+j;
       h+='<div class="sv" id="sv'+id+'" onclick="selServo('+id+')">'+
-         '<span class="tag">'+id+'</span>[ID:'+pad3(id)+'] '+JOINT[j]+'</div>';
+         '<span class="tag">'+id+'</span>'+
+         '<span class="lbl">[ID:'+pad3(id)+'] '+JOINT[j]+'</span>'+
+         '<span class="tc" id="tc'+id+'" title="NTC servo temperature">&mdash;</span></div>';
     }
   });
+  /* whole-robot thermal strip: 4 columns (one per leg/board) x 3 joints */
+  h+='<div id="thermo"><div class="th">NTC Temperature <span id="thmax">&mdash;</span></div>'+
+     '<div class="cells" id="thcells"></div></div>';
   $("tree").innerHTML=h;
+  /* header row: leg initials (FR FL RR RL), then one row per joint */
+  var c='<div class="hd"></div>';
+  LEGS.forEach(function(g){
+    c+='<div class="hd" title="'+g[0]+'">'+g[0].split(" ").map(function(w){
+        return w[0]; }).join("")+'</div>';
+  });
+  for(var j2=0;j2<3;j2++){
+    c+='<div class="rl">'+JOINT[j2]+'</div>';
+    for(var g2=0;g2<4;g2++){
+      var sid=LEGS[g2][1]+j2;
+      c+='<div class="c" id="th'+sid+'" onclick="selServo('+sid+')" title="'+
+         legName(sid)+'">&mdash;</div>';
+    }
+  }
+  $("thcells").innerHTML=c;
 }
 
 /* ---------------- param table ---------------- */
@@ -487,7 +581,9 @@ function selServo(id){
   if(!cli){ toast("Connect first (pauses the gait)"); return; }
   cur=id; selP=-1; vals={};
   document.querySelectorAll("#tree .sv").forEach(function(e){e.classList.remove("sel");});
+  document.querySelectorAll("#thermo .c").forEach(function(e){e.classList.remove("sel");});
   $("sv"+id).classList.add("sel");
+  if($("th"+id)) $("th"+id).classList.add("sel");
   $("svttl").textContent="Servo "+id+" — "+legName(id);
   clearEditor();
   buildTable();
@@ -642,6 +738,7 @@ function pollLive(){
       $("mduty").textContent=(d.duty*100).toFixed(1)+" %";
       $("mdutyf").style.width=Math.min(100,Math.abs(d.duty)*100).toFixed(0)+"%";
     }
+    if(d.temp_c !==undefined && d.temp_c!==null) setTemp(cur,d.temp_c);
     if(d.mode   !==undefined){
       $("lv_mode").textContent=MODES[d.mode]||"?";
       torque = (d.mode==1||d.mode==2);
@@ -653,6 +750,75 @@ function togglePoll(){
   polling=!polling;
   $("lpTgl").classList.toggle("on",polling);
 }
+
+/* ---------------- NTC temperature, all 12 servos ----------------
+ * /api/temps deliberately does NOT need tuning mode: the AT32 ships the
+ * NTC reading inside every ordinary feedback frame, so while the gait is
+ * running these numbers update for free. That is exactly when the servos
+ * get hot, so the strip keeps running whether or not you are Connected. */
+var temps={}, tempBusy=false;
+
+function setTemp(id,c){
+  var has=(c!==null&&c!==undefined&&!isNaN(c));
+  var ok=tOK(c);                       /* has a value AND it is plausible */
+  var none=!ok;
+  /* a present-but-impossible reading is a sensor/link fault, not "no data" */
+  var txt=ok?c.toFixed(0)+"°":(has?"ERR":"—");
+  var cellTxt=ok?c.toFixed(0):(has?"ERR":"—");
+  temps[id]=ok?c:null;
+  var cls=tClass(c)+(has&&!ok?" err":"");
+  var badge=$("tc"+id), cell=$("th"+id);
+  if(badge){ badge.textContent=txt; badge.className="tc "+cls;
+             badge.title=has&&!ok?("implausible NTC reading: "+c.toFixed(1)+" °C")
+                                 :"NTC servo temperature"; }
+  if(cell){
+    cell.textContent=cellTxt;
+    cell.className="c "+cls+(id===cur?" sel":"");
+    cell.title=legName(id)+(ok?" — "+c.toFixed(1)+" °C"
+                             :(has?" — implausible reading "+c.toFixed(1)+" °C":""));
+  }
+  /* the right-hand detail panel mirrors whichever servo is selected, and it
+     keeps working with the gait running (no tuning mode required) */
+  if(id!==cur) return;
+  $("lv_temp").innerHTML = ok ? c.toFixed(1)+" [&deg;C]"
+                              : (has ? "ERR ("+c.toFixed(1)+")" : "&mdash; [&deg;C]");
+  var mt=$("mtemp"), f=$("mtempf");
+  mt.textContent = ok ? c.toFixed(1)+" °C" : (has?"sensor fault":"—");
+  mt.className   = (ok && tBand(c)>=4) || (has&&!ok) ? "hot" : "";
+  f.style.width  = ok
+    ? Math.max(0,Math.min(100,(c-TEMP_MIN)/(TEMP_MAX-TEMP_MIN)*100)).toFixed(0)+"%"
+    : "0%";
+  f.style.background = tColor(ok?c:null);
+}
+
+function pollTemps(){
+  if(tempBusy) return;
+  tempBusy=true;
+  jget("/api/temps").then(function(d){
+    tempBusy=false;
+    if(!d.ok) return;
+    var hot=null, hotId=0;
+    d.temps.forEach(function(t){
+      setTemp(t.id, t.c);
+      /* only plausible readings feed the "max" summary and the alarm */
+      if(tOK(t.c) && (hot===null||t.c>hot)){ hot=t.c; hotId=t.id; }
+    });
+    var lbl=$("thmax");
+    if(lbl){
+      if(hot===null){ lbl.textContent="—"; lbl.style.color=""; }
+      else{
+        lbl.textContent="max "+hot.toFixed(1)+" °C · servo "+hotId;
+        lbl.style.color=tColor(hot);
+      }
+    }
+    if(hot!==null && tBand(hot)>=4 && !tempWarned){
+      tempWarned=true;
+      toast("⚠ servo "+hotId+" at "+hot.toFixed(1)+" °C — let it cool");
+      setTimeout(function(){ tempWarned=false; }, 30000);
+    }
+  }).catch(function(){ tempBusy=false; });
+}
+var tempWarned=false;
 function toggleTorque(){
   if(!cli||!cur){ toast("connect + select a servo"); return; }
   if(torque){
@@ -813,7 +979,8 @@ var TRACES=[
  {k:"err_deg",name:"Position Error",  unit:"°", color:"#ea580c",axis:0,on:false},
  {k:"now_ma", name:"Present Current", unit:"mA",color:"#2563eb",axis:1,on:true},
  {k:"cap_ma", name:"Current Cap",     unit:"mA",color:"#6b7280",axis:1,on:false},
- {k:"duty",   name:"PWM Duty ×10",    unit:"%", color:"#16a34a",axis:1,on:false,scale:1000}
+ {k:"duty",   name:"PWM Duty ×10",    unit:"%", color:"#16a34a",axis:1,on:false,scale:1000},
+ {k:"temp_c", name:"NTC Temperature", unit:"°C",color:"#db2777",axis:0,on:false}
 ];
 var gview=false, grun=false, gt0=0, gbuf=[], GWIN=15000, GMAX=6000;
 
@@ -998,6 +1165,11 @@ pollT=setInterval(function(){
 },100);
 setInterval(function(){ jget("/api/status").then(function(d){
   setConn(d.climode); }).catch(apiFail); },3000);
+/* NTC sweep of all 12 servos. Runs whether or not tuning mode is on -
+ * a 10k NTC has a thermal time constant of seconds, so 1.5 s is plenty
+ * and it keeps the SPI chatter negligible while the gait is walking. */
+pollTemps();
+setInterval(pollTemps,1500);
 </script>
 </body>
 </html>

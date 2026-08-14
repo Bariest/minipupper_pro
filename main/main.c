@@ -414,19 +414,24 @@ static void trace_print_line(int id){
     static const char *mn[] = {"IDLE","POS ","TOR ","IK  "};
     float lv[DB_LIVE_COUNT];
     bool ok = true;
-    for(int i=0; i<DB_LIVE_COUNT && ok; i++)
+    /* temperature (the last id) is fetched separately below, so that a board
+     * on older AT32 firmware still prints the rest of the trace */
+    for(int i=0; i<DB_LIVE_TEMPERATURE_C && ok; i++)
         ok = driver_board_get_live(id, i, &lv[i]);
     if(ok){
         int m = (int)lv[DB_LIVE_MODE];
+        float t;
+        if(!driver_board_get_live(id, DB_LIVE_TEMPERATURE_C, &t) || t <= DB_TEMP_INVALID)
+            t = driver_board_present_temperature(id);
         printf("pos s/n/e %6.1f/%6.1f/%5.1f deg | cur c/s/n/e %4.0f/%4.0f/%4.0f/%4.0f mA"
-               " | duty %5.1f%% | adc %4.0f/%4.0f | %s | loop %lu\n",
+               " | duty %5.1f%% | adc %4.0f/%4.0f | %s | %4.1fC | loop %lu\n",
                lv[DB_LIVE_SETPOINT_POS_DEG], lv[DB_LIVE_PRESENT_POS_DEG],
                lv[DB_LIVE_ERROR_POS_DEG],
                lv[DB_LIVE_MAX_CURRENT_MA], lv[DB_LIVE_SETPOINT_CUR_MA],
                lv[DB_LIVE_PRESENT_CUR_MA], lv[DB_LIVE_ERROR_CUR_MA],
                lv[DB_LIVE_PWM_DUTY]*100.0f,
                lv[DB_LIVE_POS_ADC], lv[DB_LIVE_CUR_ADC],
-               (m>=0&&m<4)?mn[m]:"?", (unsigned long)lv[DB_LIVE_LOOP_COUNTER]);
+               (m>=0&&m<4)?mn[m]:"?", t, (unsigned long)lv[DB_LIVE_LOOP_COUNTER]);
     }else if(driver_board_poll(id)){
         printf("pos %4u SCS  cur %5d mA  (basic - old AT32 fw)\n",
                driver_board_present_position(id), driver_board_present_current(id));
@@ -465,7 +470,10 @@ static void run_sweep(int id, float low, float high,
                 uint32_t ls = millis();
                 float lv[DB_LIVE_COUNT];
                 bool ok = true;
-                for(int i=0; i<DB_LIVE_COUNT && ok; i++)
+                /* only the values this CSV prints - do NOT add temperature
+                 * here, it is one more SPI round-trip per sample and the
+                 * sweep runs at up to 200 Hz */
+                for(int i=0; i<DB_LIVE_TEMPERATURE_C && ok; i++)
                     ok = driver_board_get_live(id, i, &lv[i]);
                 if(ok){
                     printf("%lu,%.1f,%.1f,%.1f,%.1f,%.0f,%.1f\n",
@@ -2785,14 +2793,18 @@ static esp_err_t h_tracepoll(httpd_req_t*r){
 
     float lv[DB_LIVE_COUNT];
     bool live_ok = true;
-    for(int i=0; i<DB_LIVE_COUNT && live_ok; i++)
+    /* temperature (last id) is optional - see h_api_live() */
+    for(int i=0; i<DB_LIVE_TEMPERATURE_C && live_ok; i++)
         live_ok = driver_board_get_live(id, i, &lv[i]);
 
-    char b[560];
+    char b[640];
     if(live_ok){
         static const char *mn[] = {"IDLE","POSITION","TORQUE","IK"};
         int m = (int)lv[DB_LIVE_MODE];
-        snprintf(b, sizeof b,
+        float t;
+        if(!driver_board_get_live(id, DB_LIVE_TEMPERATURE_C, &t) || t <= DB_TEMP_INVALID)
+            t = driver_board_present_temperature(id);
+        int n = snprintf(b, sizeof b,
             "TRACE servo %d (live)   mode=%s   loop=%lu\n"
             "position:  set=%7.1f deg  now=%7.1f deg  err=%6.1f deg\n"
             "current:   cap=%5.0f mA  set=%5.0f mA  now=%5.0f mA  err=%5.0f mA\n"
@@ -2805,13 +2817,20 @@ static esp_err_t h_tracepoll(httpd_req_t*r){
             lv[DB_LIVE_PRESENT_CUR_MA], lv[DB_LIVE_ERROR_CUR_MA],
             lv[DB_LIVE_PWM_DUTY]*100.0f,
             lv[DB_LIVE_POS_ADC], lv[DB_LIVE_CUR_ADC]);
+        if(t > DB_TEMP_INVALID)
+            snprintf(b+n, sizeof b-n, "NTC temp:  %5.1f degC\n", t);
+        else
+            snprintf(b+n, sizeof b-n, "NTC temp:  --  (no reading)\n");
     }else if(driver_board_poll(id)){
         // old AT32 firmware without GET_LIVE: basic feedback only
         uint16_t p = driver_board_present_position(id);
-        snprintf(b, sizeof b,
+        float t = driver_board_present_temperature(id);
+        int n = snprintf(b, sizeof b,
             "TRACE servo %d (basic - flash new AT32 fw for full trace)\n"
             "pos = %4u SCS  %6.1f deg raw\ncur = %4d mA\n",
             id, p, (float)p*270.0f/1024.0f, driver_board_present_current(id));
+        if(t > DB_TEMP_INVALID)
+            snprintf(b+n, sizeof b-n, "ntc = %5.1f degC\n", t);
     }else{
         snprintf(b, sizeof b, "trace: SPI poll failed\n");
     }
@@ -2848,13 +2867,16 @@ static esp_err_t api_json(httpd_req_t*r, const char*s){
 /* /api/angles : read all 12 servo present positions as JSON.
  * Works WITHOUT CLI mode so you can monitor angles while the gait runs. */
 static esp_err_t h_api_angles(httpd_req_t*r){
-    char b[384]; int n = 0;
+    char b[640]; int n = 0;
     n += snprintf(b+n, sizeof b-n, "{\"ok\":true,\"angles\":[");
     for(int id=1; id<=12; id++){
         uint16_t pos = driver_board_present_position(id);
         float deg = (float)pos * 270.0f / 1024.0f;
-        n += snprintf(b+n, sizeof b-n, "%s{\"id\":%d,\"scs\":%u,\"deg\":%.1f}",
+        float t   = driver_board_present_temperature(id);   /* rides on the same frame */
+        n += snprintf(b+n, sizeof b-n, "%s{\"id\":%d,\"scs\":%u,\"deg\":%.1f,\"c\":",
                       id==1?"":",", id, pos, deg);
+        if(t > DB_TEMP_INVALID) n += snprintf(b+n, sizeof b-n, "%.1f}", t);
+        else                    n += snprintf(b+n, sizeof b-n, "null}");
     }
     n += snprintf(b+n, sizeof b-n, "]}");
     return api_json(r,b);
@@ -2978,15 +3000,27 @@ static esp_err_t h_api_live(httpd_req_t*r){
     if(!CliMode)      return api_json(r,"{\"ok\":false,\"err\":\"climode\"}");
     if(id<1 || id>12) return api_json(r,"{\"ok\":false,\"err\":\"bad id\"}");
     float lv[DB_LIVE_COUNT]; bool ok=true;
-    for(int i=0; i<DB_LIVE_COUNT && ok; i++)
+    /* Everything up to DB_LIVE_TEMPERATURE_C is required. Temperature is
+     * fetched separately and treated as optional so that a board still
+     * running pre-NTC AT32 firmware degrades to "no temperature" instead of
+     * dropping the whole trace back to the basic path. */
+    for(int i=0; i<DB_LIVE_TEMPERATURE_C && ok; i++)
         ok = driver_board_get_live(id, i, &lv[i]);
-    char b[512];
+    char b[576];
     if(ok){
-        snprintf(b,sizeof b,
+        /* NTC temperature: prefer the live read, fall back to the value that
+         * rides along on every ordinary feedback frame. */
+        float t;
+        bool have_t = driver_board_get_live(id, DB_LIVE_TEMPERATURE_C, &t);
+        if(!have_t || t <= DB_TEMP_INVALID){
+            t = driver_board_present_temperature(id);
+            have_t = (t > DB_TEMP_INVALID);
+        }
+        int n = snprintf(b,sizeof b,
             "{\"ok\":true,\"full\":true,\"pos_adc\":%g,\"cur_adc\":%g,"
             "\"set_deg\":%g,\"now_deg\":%g,\"err_deg\":%g,"
             "\"cap_ma\":%g,\"set_ma\":%g,\"now_ma\":%g,\"err_ma\":%g,"
-            "\"duty\":%g,\"mode\":%d,\"loop\":%lu}",
+            "\"duty\":%g,\"mode\":%d,\"loop\":%lu",
             lv[DB_LIVE_POS_ADC], lv[DB_LIVE_CUR_ADC],
             lv[DB_LIVE_SETPOINT_POS_DEG], lv[DB_LIVE_PRESENT_POS_DEG],
             lv[DB_LIVE_ERROR_POS_DEG],
@@ -2994,14 +3028,46 @@ static esp_err_t h_api_live(httpd_req_t*r){
             lv[DB_LIVE_PRESENT_CUR_MA], lv[DB_LIVE_ERROR_CUR_MA],
             lv[DB_LIVE_PWM_DUTY], (int)lv[DB_LIVE_MODE],
             (unsigned long)lv[DB_LIVE_LOOP_COUNTER]);
+        if(have_t) n += snprintf(b+n,sizeof b-n,",\"temp_c\":%.1f", t);
+        snprintf(b+n,sizeof b-n,"}");
     }else if(driver_board_poll(id)){
-        uint16_t p = driver_board_present_position(id);
-        snprintf(b,sizeof b,
-            "{\"ok\":true,\"full\":false,\"now_deg\":%g,\"now_ma\":%d}",
-            (float)p*270.0f/1024.0f, driver_board_present_current(id));
+        float t = driver_board_present_temperature(id);
+        int n = snprintf(b,sizeof b,
+            "{\"ok\":true,\"full\":false,\"now_deg\":%g,\"now_ma\":%d",
+            (float)driver_board_present_position(id)*270.0f/1024.0f,
+            driver_board_present_current(id));
+        if(t > DB_TEMP_INVALID) n += snprintf(b+n,sizeof b-n,",\"temp_c\":%.1f", t);
+        snprintf(b+n,sizeof b-n,"}");
     }else{
         snprintf(b,sizeof b,"{\"ok\":false,\"err\":\"spi\"}");
     }
+    return api_json(r,b);
+}
+
+/* /api/temps : NTC temperature of all 12 servos, degC.
+ *
+ * Deliberately works WITHOUT CLI mode: the AT32 puts the temperature in
+ * every feedback frame, so while the gait is running the cache is already
+ * fresh and this costs no SPI traffic at all. When the gait is parked
+ * (CLI mode) the cache would go stale, so re-poll the four boards first -
+ * board_resend() replays the last commanded frame, which leaves an idle
+ * servo idle and a holding servo holding.
+ *
+ * Reply: {"ok":true,"climode":0|1,"temps":[{"id":1,"c":31.4},...]}
+ *        "c" is null for a servo that has never answered.               */
+static esp_err_t h_api_temps(httpd_req_t*r){
+    if(CliMode) for(int bd=0; bd<4; bd++) driver_board_poll_board(bd);
+
+    char b[512]; int n = 0;
+    n += snprintf(b+n, sizeof b-n, "{\"ok\":true,\"climode\":%d,\"temps\":[", CliMode?1:0);
+    for(int id=1; id<=12; id++){
+        float t = driver_board_present_temperature(id);
+        if(t > DB_TEMP_INVALID)
+            n += snprintf(b+n, sizeof b-n, "%s{\"id\":%d,\"c\":%.1f}", id==1?"":",", id, t);
+        else
+            n += snprintf(b+n, sizeof b-n, "%s{\"id\":%d,\"c\":null}", id==1?"":",", id);
+    }
+    snprintf(b+n, sizeof b-n, "]}");
     return api_json(r,b);
 }
 
@@ -3132,6 +3198,7 @@ static void start_webserver(void){
     reg(s,"/api/restore",h_api_restore);
     reg(s,"/api/direct",h_api_direct);
     reg(s,"/api/scan",h_api_scan);
+    reg(s,"/api/temps",h_api_temps);   // NTC temps, all 12, works with gait running
     reg(s,"/periodM",h_periodM); reg(s,"/periodP",h_periodP);
     reg(s,"/heightM",h_heightM); reg(s,"/heightP",h_heightP);
     reg(s,"/upHeightM",h_upM);   reg(s,"/upHeightP",h_upP);

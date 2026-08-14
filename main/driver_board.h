@@ -186,6 +186,28 @@ void driver_board_sync_write(const uint16_t pos[12], const uint16_t cur_mA[12]);
 int16_t  driver_board_present_current(int ch);   /* motor current, mA (signed) */
 uint16_t driver_board_present_position(int ch);  /* SCS scale 0..1023          */
 
+/* ---- NTC servo temperature ---------------------------------------------
+ * The AT32 firmware samples one 10k NTC per servo (MTA10103F3380F00, 10k
+ * pull-up to 3V3, NTC to GND) at ~22 Hz and ships the reading in the
+ * feedback frame's reserved1 field as a SIGNED value in 0.1 degC
+ * (253 => 25.3 degC).
+ *
+ * That field rides along on EVERY feedback frame, so this cache is
+ * refreshed FOR FREE by driver_board_sync_write() while the gait runs -
+ * zero extra SPI traffic. When the gait is parked (CLI mode) refresh it
+ * with driver_board_poll() / driver_board_poll_board().
+ *
+ * Returns degC, or DB_TEMP_INVALID if that servo has never answered.     */
+#define DB_TEMP_INVALID  (-273.0f)
+
+float driver_board_present_temperature(int ch);  /* degC, ch = 1..12 */
+
+/* Refresh the whole feedback cache (position / current / temperature) for
+ * ONE board by resending its last commanded frame. board = 0..3 in
+ * PHYSICAL board order (FR, FL, RR, RL). Setpoints are unchanged, so this
+ * is safe while parked in CLI mode - an idle servo stays idle. */
+bool driver_board_poll_board(int board /*0..3*/);
+
 /* ---- AT32 sms_config parameter access over SPI (web CLI) ----------------
  * Parameter ids match the AT32 UART CLI table order.
  * NOTE: do not run these concurrently with driver_board_sync_write() —
@@ -249,6 +271,7 @@ enum {
     DB_LIVE_PWM_DUTY,           /* PWM duty cycle 0..1          */
     DB_LIVE_MODE,               /* 0 idle 1 position 2 torque   */
     DB_LIVE_LOOP_COUNTER,       /* control loop tick counter    */
+    DB_LIVE_TEMPERATURE_C,      /* NTC servo temperature, degC  */
     DB_LIVE_COUNT
 };
 

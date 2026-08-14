@@ -30,21 +30,69 @@
 /* ---- on-the-wire protocol (identical to AT32 spi_command_frame) ---- */
 #define START_FIELD  0xA5A5
 #define MODE_FIELD   0x0001
+/* Frame markers the AT32 sends back. Both feedback and config replies carry
+ * start = 0xFEED; only `status` tells them apart. Defined up here (not down
+ * in the config section) because fb_frame_valid() below needs it.         */
+#define FB_START_FIELD   0xFEED   /* AT32 -> host, both reply kinds        */
+#define FB_STATUS_SERVO  0x0003   /* ordinary servo feedback               */
+#define START_CONFIG     0xC0DE   /* config-frame request AND reply marker */
 #define MODE_POSITION 0x0001   /* AT32: position control, "torque" field = max current mA */
 
 #pragma pack(push,1)
 typedef struct { uint16_t mode, position; int16_t torque; uint16_t kp, kd; } servo_cmd_sub_t;
 typedef struct { uint16_t start, mode; servo_cmd_sub_t s1, s2, s3; uint16_t check_sum; } host_SMS_t;
 
-typedef struct { uint16_t status, position; int16_t torque; uint32_t res; } servo_fb_sub_t;
+/* res1 = NTC temperature, SIGNED, 0.1 degC (AT32 "reserved1").
+ * res2 = still unused, sent as 0.  They were one uint32_t "res" before the
+ * AT32 firmware started filling in the temperature; the config-frame reply
+ * path packs a float across BOTH halves, which still works because the
+ * struct is #pragma pack(1) and the two words are adjacent. */
+typedef struct { uint16_t status, position; int16_t torque; uint16_t res1, res2; } servo_fb_sub_t;
 typedef struct { uint16_t start, status; servo_fb_sub_t s1, s2, s3; uint16_t check_sum; } SMS_host_t;
 #pragma pack(pop)
 
 static spi_device_handle_t dev_left_front, dev_right_front, dev_left_rear, dev_right_rear;
 
-/* cached feedback, index 0 == servo ID 1 */
+/* cached feedback, indexed by PHYSICAL channel (index 0 == physical chan 1) */
 static uint16_t fb_position[12];
 static int16_t  fb_current[12];
+/* NTC temperature in 0.1 degC, signed. INT16_MIN = never received. */
+#define FB_TEMP_NONE  ((int16_t)-32768)
+static int16_t  fb_temp_dc[12] = { [0 ... 11] = FB_TEMP_NONE };
+
+/* True only for a REAL servo feedback frame.
+ *
+ * This guard matters. The AT32's config_frame_handler() builds its reply in
+ * the SAME tx buffer as the feedback frame and also stamps start = 0xFEED;
+ * the only thing separating the two is status (0x0003 feedback vs 0xC0DE
+ * config reply). Worse, the reply is clocked out on the transaction AFTER
+ * the request and the NOP path deliberately does NOT clear it, so a config
+ * reply can still be pending when the next ordinary servo frame goes out.
+ *
+ * In a config reply servo1.reserved1/reserved2 hold a FLOAT, not a
+ * temperature, and servo2/servo3 are left untouched (stale). Storing one
+ * would decode the low half of that float as deci-degC - e.g. a real
+ * 31.03 degC reply (0x41F83C30) reads back as 0x3C30 = 15408 = 1540.8 degC,
+ * and only ever on servo1 of that board. Reject it instead.
+ *
+ * It also rejects an all-zero / all-ones frame from a board that is absent
+ * or not powered, which previously landed in the cache as position 0.     */
+static inline bool fb_frame_valid(const SMS_host_t *rx)
+{
+    return rx->start == FB_START_FIELD && rx->status != START_CONFIG;
+}
+
+/* Pull position / current / temperature out of one feedback frame into the
+ * caches. b = index of the board's first physical channel (0,3,6,9). */
+static void fb_store(int b, const SMS_host_t *rx)
+{
+    const servo_fb_sub_t *fb[3] = { &rx->s1, &rx->s2, &rx->s3 };
+    for (int j = 0; j < 3; j++) {
+        fb_position[b + j] = (uint16_t)((uint32_t)fb[j]->position * 1024u / 2700u);
+        fb_current[b + j]  = fb[j]->torque;          /* present motor current, mA */
+        fb_temp_dc[b + j]  = (int16_t)fb[j]->res1;   /* NTC temperature, 0.1 degC */
+    }
+}
 
 /* shadow of the last commanded state per servo (deci-degrees), so a direct
  * single-servo write can resend the board frame without disturbing the
@@ -145,18 +193,16 @@ void driver_board_sync_write(const uint16_t pos[12], const uint16_t cur_mA[12])
         }
         frame.check_sum = 0;
 
-        if (spi_xfer((uint8_t)i, sizeof(host_SMS_t), (uint8_t *)&frame, (uint8_t *)&rx) == ESP_OK) {
-            servo_fb_sub_t *fb[3] = { &rx.s1, &rx.s2, &rx.s3 };
-            for (int j = 0; j < 3; j++) {
-                fb_position[b + j] = (uint16_t)((uint32_t)fb[j]->position * 1024u / 2700u);
-                fb_current[b + j]  = fb[j]->torque;   /* present motor current, mA */
-            }
-        }
+        if (spi_xfer((uint8_t)i, sizeof(host_SMS_t), (uint8_t *)&frame, (uint8_t *)&rx) == ESP_OK
+            && fb_frame_valid(&rx))
+            fb_store(b, &rx);   /* position + current + NTC temperature */
+        /* an invalid frame is simply skipped - this runs at ~200 Hz, so the
+         * cache is refreshed on the very next tick */
     }
 }
 
 /* ---- AT32 sms_config parameter access (config frames, start 0xC0DE) ---- */
-#define START_CONFIG    0xC0DE
+/* START_CONFIG is defined near the top, next to the other wire constants */
 #define CFG_OP_NOP      0
 #define CFG_OP_SET      1
 #define CFG_OP_GET      2
@@ -218,7 +264,9 @@ static bool cfg_request(uint8_t board, uint16_t op, uint16_t servo_index,
     if (!cfg_xfer(board, CFG_OP_NOP, 0, 0, 0, &rx)) return false;
     if (rx.status != START_CONFIG) return false; /* not a config response  */
     if (rx.s1.position != param_id) return false;/* echo mismatch          */
-    if (out) memcpy(out, &rx.s1.res, sizeof(float));
+    /* the AT32 packs the float across reserved1+reserved2 (res1/res2 here,
+     * adjacent in a packed struct), little endian */
+    if (out) memcpy(out, &rx.s1.res1, sizeof(float));
     return true;
 }
 
@@ -283,15 +331,27 @@ static bool board_resend(int board)
     }
     frame.check_sum = 0;
 
-    if (spi_xfer((uint8_t)board, sizeof frame, (uint8_t *)&frame, (uint8_t *)&rx) != ESP_OK)
-        return false;
-
-    servo_fb_sub_t *fb[3] = { &rx.s1, &rx.s2, &rx.s3 };
-    for (int j = 0; j < 3; j++) {
-        fb_position[b + j] = (uint16_t)((uint32_t)fb[j]->position * 1024u / 2700u);
-        fb_current[b + j]  = fb[j]->torque;
+    /* Two attempts. If a config reply was still pending in the AT32's tx
+     * buffer (cfg_request's NOP leaves it there on purpose), the FIRST frame
+     * we clock out is that reply, not feedback. Sending this servo frame is
+     * what makes the AT32 rebuild a proper feedback frame, so the second
+     * attempt always gets it - one repeat is provably enough, never a loop. */
+    for (int attempt = 0; attempt < 2; attempt++) {
+        if (spi_xfer((uint8_t)board, sizeof frame, (uint8_t *)&frame, (uint8_t *)&rx) != ESP_OK)
+            return false;
+        if (fb_frame_valid(&rx)) {
+            fb_store(b, &rx);   /* position + current + NTC temperature */
+            return true;
+        }
+        esp_rom_delay_us(200);   /* let the AT32 IRQ refill its tx buffer */
     }
-    return true;
+    return false;   /* board absent, or still not answering with feedback */
+}
+
+bool driver_board_poll_board(int board)
+{
+    if (board < 0 || board > 3) return false;
+    return board_resend(board);
 }
 
 bool driver_board_direct(int servo, uint16_t mode, float pos_deg, int16_t current_mA)
@@ -323,4 +383,12 @@ uint16_t driver_board_present_position(int ch)
 {
     if (ch < 1 || ch > 12) return 0;
     return fb_position[db_phys(ch) - 1];
+}
+
+float driver_board_present_temperature(int ch)
+{
+    if (ch < 1 || ch > 12) return DB_TEMP_INVALID;
+    int16_t dc = fb_temp_dc[db_phys(ch) - 1];
+    if (dc == FB_TEMP_NONE) return DB_TEMP_INVALID;
+    return (float)dc * 0.1f;
 }
